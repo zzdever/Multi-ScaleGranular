@@ -1,20 +1,34 @@
 #include <mitsuba/core/plugin.h>
 
+#ifndef TEMPINFO_H
+#define TEMPINFO_H
 
 MTS_NAMESPACE_BEGIN
 
-struct IntersectedSphereInfo{
+typedef enum {
+    EPT,
+    VPT,
+    DA,
+    DEBUG
+} MODES_T;
+
+
+struct GrainIntersectionInfo{
+    bool valid;
+    MODES_T rendermode;
+    void* object;
+
     Float radius;
     Float x;
     Float y;
     Float z;
     Float w;
-    Point center;
-    int name;
-    Float ox, oy, oz, t;
-    Float ix, iy, iz;
-public:
-    IntersectedSphereInfo():radius(0), x(0), y(0), z(0), w(0) {}
+};
+
+struct hitInfo{
+    void * hitObject;
 };
 
 MTS_NAMESPACE_END
+
+#endif

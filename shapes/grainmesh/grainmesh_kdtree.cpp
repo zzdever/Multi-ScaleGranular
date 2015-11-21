@@ -124,7 +124,7 @@ KDNode& KDNode::operator=(const KDNode& rhs) {
 }
 
 
-bool KDNode::hit(const Ray& ray, float& t, float& tmin/*, ShadeRec& sr*/) const {
+bool KDNode::hit(const Ray& ray, float& t, float& tmin, hitInfo* info/*, ShadeRec& sr*/) {
     //if (node->bbox.hit(ray)) {
     if(aabbHit(this->bbox, ray)) {
         //Normal normal;
@@ -134,20 +134,22 @@ bool KDNode::hit(const Ray& ray, float& t, float& tmin/*, ShadeRec& sr*/) const 
 
         if ((this->left != NULL && this->left->triangles.size() > 0) || (this->right != NULL && this->right->triangles.size() > 0)) {
             if(this->left != NULL && this->left->triangles.size() > 0)
-                hitl = this->left->hit(ray, t, tmin/*, sr*/);
+                hitl = this->left->hit(ray, t, tmin, info/*, sr*/);
             if(this->right != NULL && this->right->triangles.size() > 0)
-                hitr = this->right->hit(ray, t, tmin/*, sr*/);
+                hitr = this->right->hit(ray, t, tmin, info/*, sr*/);
             return hitl || hitr;
         }
         // leaf node
         else {
             float nearestT = 1.0/0.0;
             float to;
+            KDTriangle *hitTriangle;
             for (size_t i=0; i < this->triangles.size(); i++) {
                 if (this->triangles[i]->hit(ray, to, tmin/*, sr*/)) {
                     if (to<nearestT) {
                         hit_tri = true;
                         nearestT = to;
+                        hitTriangle = this->triangles[i];
                     }
                     //ying sr.hit_obj = true;
                     //ying tmin = t;
@@ -170,6 +172,9 @@ bool KDNode::hit(const Ray& ray, float& t, float& tmin/*, ShadeRec& sr*/) const 
 
                 if(nearestT < t) {
                     t = nearestT;
+                    if(NULL != info) {
+                        info->hitObject = (void*)hitTriangle;
+                    }
                 }
                 return true;
             }
@@ -177,6 +182,61 @@ bool KDNode::hit(const Ray& ray, float& t, float& tmin/*, ShadeRec& sr*/) const 
         }
     }
     return false;
+}
+
+int KDNode::hitCount(const Ray& ray, float& t, float& tmin) {
+    int count = 0;
+
+    if(aabbHit(this->bbox, ray)) {
+
+        if ((this->left != NULL && this->left->triangles.size() > 0) || (this->right != NULL && this->right->triangles.size() > 0)) {
+            if(this->left != NULL && this->left->triangles.size() > 0)
+                count += this->left->hitCount(ray, t, tmin);
+            if(this->right != NULL && this->right->triangles.size() > 0)
+                count += this->right->hitCount(ray, t, tmin);
+            return count;
+        }
+        // leaf node
+        else {
+            float to;
+            for (size_t i=0; i < this->triangles.size(); i++) {
+                if (this->triangles[i]->hit(ray, to, tmin) && to>tmin) {
+                    count++;
+                }
+            }
+            return count;
+        }
+    }
+    return count;
+}
+
+bool KDNode::isPointInside(Point p) {
+
+    float tout = 1.0/0.0, tmin = 0.;
+    return ((tmin = 0., tout = 1.0/0.0, hit(Ray(p, Vector(1,0,0), (Float)0), tout, tmin))
+     && (tmin = 0., tout = 1.0/0.0, hit(Ray(p, Vector(-1,0,0), (Float)0), tout, tmin))
+     && (tmin = 0., tout = 1.0/0.0, hit(Ray(p, Vector(0,1,0), (Float)0), tout, tmin))
+     && (tmin = 0., tout = 1.0/0.0, hit(Ray(p, Vector(0,-1,0), (Float)0), tout, tmin))
+     && (tmin = 0., tout = 1.0/0.0, hit(Ray(p, Vector(0,0,1), (Float)0), tout, tmin))
+     && (tmin = 0., tout = 1.0/0.0, hit(Ray(p, Vector(0,0,-1), (Float)0), tout, tmin)));
+
+
+    /*
+    float t=1.0/0.0, tmin = 0.;
+    int a = (hitCount(Ray(p, Vector(1,0,0), 0), t, tmin));
+    int b = (hitCount(Ray(p, Vector(-1,0,0), 0), t, tmin));
+    int c = (hitCount(Ray(p, Vector(0,1,0), 0), t, tmin));
+    int d = (hitCount(Ray(p, Vector(0,-1,0), 0), t, tmin));
+    int e = (hitCount(Ray(p, Vector(0,0,1), 0), t, tmin));
+    int f = (hitCount(Ray(p, Vector(0,0,-1), 0), t, tmin));
+
+    return (((hitCount(Ray(p, Vector(1,0,0), 0), t, tmin)) % 2 == 1) &&
+           ((hitCount(Ray(p, Vector(-1,0,0), 0), t, tmin)) % 2 == 1)) &&
+           (((hitCount(Ray(p, Vector(0,1,0), 0), t, tmin)) % 2 == 1) &&
+           ((hitCount(Ray(p, Vector(0,-1,0), 0), t, tmin)) % 2 == 1)) &&
+           (((hitCount(Ray(p, Vector(0,0,1), 0), t, tmin)) % 2 == 1) &&
+           ((hitCount(Ray(p, Vector(0,0,-1), 0), t, tmin)) % 2 == 1));
+           */
 }
 
 #if 0

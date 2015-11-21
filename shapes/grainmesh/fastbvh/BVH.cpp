@@ -56,10 +56,10 @@ bool BVH::getIntersection(const FastBVH::Ray& ray, FastBVH::IntersectionInfo* in
           }
 
           // Otherwise, keep the closest intersection only
-          if(intersection->t < 0 && current.t >= 0)
+          if(intersection->t <= 0 && current.t > 0)
               *intersection = current;
 
-          if (current.t >= 0 && current.t < intersection->t) {
+          if (current.t > 0 && current.t < intersection->t) {
             *intersection = current;
           }
         }

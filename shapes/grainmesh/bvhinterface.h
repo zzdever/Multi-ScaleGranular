@@ -21,7 +21,7 @@ public:
         for(size_t i=0; i<N; ++i) {
             objects.push_back(new FastBVH::Sphere(
                 FastBVH::Vector3(m_spherePack[i].x, m_spherePack[i].y, m_spherePack[i].z),
-                m_spherePack[i].d/2)
+                m_spherePack[i].d/2.0)
 			);
             // objects may be modified
             objects_bak.push_back(objects.at(i));
@@ -31,12 +31,24 @@ public:
         bvh = new BVH(&objects);
 	}
 
-    SpherePack::Sphere* rayIntersect(Point o, Point d, FastBVH::IntersectionInfo &I){
-        FastBVH::Ray ray(FastBVH::Vector3(o.x, o.y, o.z), normalize(FastBVH::Vector3(d.x, d.y, d.z)));
+    SpherePack::Sphere* rayIntersect(Point _o, Point _d, FastBVH::IntersectionInfo &I){
+        FastBVH::Vector3 o = FastBVH::Vector3(_o.x, _o.y, _o.z);
+        FastBVH::Vector3 d = normalize(FastBVH::Vector3(_d.x, _d.y, _d.z));
+        FastBVH::Ray ray(o, d);
         if (! bvh->getIntersection(ray, &I, false))
             return NULL;
 
-        if(I.t < 0)
+        // is the origin in a sphere?
+        if(length(o - static_cast<const Sphere*>(I.object)->center) <= m_spherePack[0].d/2.0) {
+            o = o + I.t * d;
+        }
+
+        // trace again
+        ray.o = o;
+        if (! bvh->getIntersection(ray, &I, false))
+            return NULL;
+
+        if(I.t <= 0)
             return NULL;
 
         //printf("fbvh:ooo: %f, %f, %f\n fbvh:ddd: %f, %f, %f\n fbvh:hit: %f, %f, %f\n",

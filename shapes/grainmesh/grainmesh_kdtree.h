@@ -14,6 +14,8 @@
 #include <mitsuba/mitsuba.h>
 #include <mitsuba/core/aabb.h>
 
+#include "tempinfo.h"
+
 using namespace mitsuba;
 
 namespace grain {
@@ -21,11 +23,31 @@ namespace grain {
 struct KDTriangle {
     //uint32_t idx[3];
     Point m_points[3];
+    bool m_hasNormal;
+    Normal m_normals[3];
+    bool m_hasUV;
+    Point2 m_uvs[3];
 
     KDTriangle(Point p1, Point p2, Point p3) {
+        m_hasNormal = false;
+        m_hasUV = false;
         m_points[0] = p1;
         m_points[1] = p2;
         m_points[2] = p3;
+    }
+
+    inline void addNormal(Normal n1, Normal n2, Normal n3) {
+        m_hasUV = true;
+        m_normals[0] = n1;
+        m_normals[1] = n2;
+        m_normals[2] = n3;
+    }
+
+    inline void addUV(Point2 uv1, Point2 uv2, Point2 uv3) {
+        m_hasUV = true;
+        m_uvs[0] = uv1;
+        m_uvs[1] = uv2;
+        m_uvs[2] = uv3;
     }
 
     inline AABB getAABB() const {
@@ -37,6 +59,22 @@ struct KDTriangle {
 
     inline Point get_midpoint() const {
         return (m_points[0] + m_points[1] + m_points[2]) / 3.0;
+    }
+
+    inline Normal getNormal() const {
+        return (m_normals[0] + m_normals[1] + m_normals[2]) / 3.0;
+    }
+
+    inline Point2 getUV() const {
+        return (m_uvs[0] + m_uvs[1] + m_uvs[2]) / 3.0;
+    }
+
+    inline TangentSpace getUVTangent() const {
+        // TODO use a correct one
+        TangentSpace t;
+        t.dpdu = (m_points[1] - m_points[0]);
+        t.dpdv = (m_points[2] - m_points[0]);
+        return t;
     }
 
     inline Vector operator=(Point p) {
@@ -278,7 +316,9 @@ public:
 
     int total();
 
-    bool hit(const Ray& ray, float& t, float& tmin/*, ShadeRec& sr*/) const;
+    bool hit(const Ray& ray, float& t, float& tmin, hitInfo *info=NULL/*, ShadeRec& sr*/);
+    int hitCount(const Ray& ray, float& t, float& tmin);
+    bool isPointInside(Point p) ;
     //bool shadow_hit(KDNode* node, const Ray& ray, float& tmin, float Li) const;
 
 private:

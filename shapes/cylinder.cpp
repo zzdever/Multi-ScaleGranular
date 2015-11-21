@@ -212,8 +212,8 @@ public:
 		Vector dpdu = Vector(-local.y, local.x, 0) * (2*M_PI);
 		Vector dpdv = Vector(0, 0, m_length);
 		its.shape = this;
-		its.dpdu = m_objectToWorld(dpdu);
-		its.dpdv = m_objectToWorld(dpdv);
+        its.dpdu = m_objectToWorld(dpdu);
+        its.dpdv = m_objectToWorld(dpdv);
 		its.geoFrame.s = normalize(its.dpdu);
 		its.geoFrame.t = normalize(its.dpdv);
 		its.geoFrame.n = Normal(cross(its.geoFrame.s, its.geoFrame.t));

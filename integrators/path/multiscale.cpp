@@ -4,6 +4,8 @@
 
 #include "../../shapes/grainmesh/tempinfo.h"
 
+#include <fstream>
+
 MTS_NAMESPACE_BEGIN
 
 #define OUTPUT_CONDITION (control_timer->getMicroseconds()%1000 == 0)
@@ -13,6 +15,248 @@ static StatsCounter avgPathLength("Path tracer", "Average path length", EAverage
 
 static StatsCounter count("Path tracer", "marker", ENumberValue);
 
+
+class MultiScale : public MonteCarloIntegrator {
+public:
+    MultiScale(const Properties &props)
+        : MonteCarloIntegrator(props) { }
+
+    /// Unserialize from a binary data stream
+    MultiScale(Stream *stream, InstanceManager *manager)
+        : MonteCarloIntegrator(stream, manager) { }
+
+    Spectrum Li(const RayDifferential &r, RadianceQueryRecord &rRec) const {
+        /* Some aliases and local variables */
+        const Scene *scene = rRec.scene;
+        Intersection &its = rRec.its;
+        RayDifferential ray(r);
+        Spectrum Li(0.0f);
+        bool scattered = false;
+
+        /* Perform the first ray intersection (or ignore if the
+           intersection has already been provided). */
+        rRec.rayIntersect(ray);
+        ray.mint = Epsilon;
+
+        Spectrum throughput(1.0f);
+        Float eta = 1.0f;
+
+        GrainIntersectionInfo* info = static_cast<GrainIntersectionInfo*>(its.temp);
+
+        while (rRec.depth <= m_maxDepth || m_maxDepth < 0) {
+            if (!its.isValid()) {
+                /* If no intersection could be found, potentially return
+                   radiance from a environment luminaire if it exists */
+                if ((rRec.type & RadianceQueryRecord::EEmittedRadiance)
+                    && (!m_hideEmitters || scattered))
+                    Li += throughput * scene->evalEnvironment(ray);
+                break;
+            }
+
+            const BSDF *bsdf = its.getBSDF(ray);
+
+            /* Possibly include emitted radiance if requested */
+            if (its.isEmitter() && (rRec.type & RadianceQueryRecord::EEmittedRadiance)
+                && (!m_hideEmitters || scattered))
+                Li += throughput * its.Le(-ray.d);
+
+            /* Include radiance from a subsurface scattering model if requested */
+            if (its.hasSubsurface() && (rRec.type & RadianceQueryRecord::ESubsurfaceRadiance))
+                Li += throughput * its.LoSub(scene, rRec.sampler, -ray.d, rRec.depth);
+
+            if ((rRec.depth >= m_maxDepth && m_maxDepth > 0)
+                || (m_strictNormals && dot(ray.d, its.geoFrame.n)
+                    * Frame::cosTheta(its.wi) >= 0)) {
+
+                /* Only continue if:
+                   1. The current path length is below the specifed maximum
+                   2. If 'strictNormals'=true, when the geometric and shading
+                      normals classify the incident direction to the same side */
+                break;
+            }
+
+            /* ==================================================================== */
+            /*                     Direct illumination sampling                     */
+            /* ==================================================================== */
+
+            /* Estimate the direct illumination if this is requested */
+            DirectSamplingRecord dRec(its);
+
+            if (rRec.type & RadianceQueryRecord::EDirectSurfaceRadiance &&
+                (bsdf->getType() & BSDF::ESmooth)) {
+                Spectrum value = scene->sampleEmitterDirect(dRec, rRec.nextSample2D());
+                if (!value.isZero()) {
+                    const Emitter *emitter = static_cast<const Emitter *>(dRec.object);
+
+                    /* Allocate a record for querying the BSDF */
+                    BSDFSamplingRecord bRec(its, its.toLocal(dRec.d), ERadiance);
+
+                    /* Evaluate BSDF * cos(theta) */
+                    const Spectrum bsdfVal = bsdf->eval(bRec);
+
+                    /* Prevent light leaks due to the use of shading normals */
+                    if (!bsdfVal.isZero() && (!m_strictNormals
+                            || dot(its.geoFrame.n, dRec.d) * Frame::cosTheta(bRec.wo) > 0)) {
+
+                        /* Calculate prob. of having generated that direction
+                           using BSDF sampling */
+                        Float bsdfPdf = (emitter->isOnSurface() && dRec.measure == ESolidAngle)
+                            ? bsdf->pdf(bRec) : 0;
+
+                        /* Weight using the power heuristic */
+                        Float weight = miWeight(dRec.pdf, bsdfPdf);
+                        Li += throughput * value * bsdfVal * weight;
+                    }
+                }
+            }
+
+
+            if(EPT == info->rendermode) {
+            /* ==================================================================== */
+            /*                            BSDF sampling                             */
+            /* ==================================================================== */
+
+            /* Sample BSDF * cos(theta) */
+            Float bsdfPdf;
+            BSDFSamplingRecord bRec(its, rRec.sampler, ERadiance);
+            Spectrum bsdfWeight = bsdf->sample(bRec, bsdfPdf, rRec.nextSample2D());
+            if (bsdfWeight.isZero())
+                break;
+
+            scattered |= bRec.sampledType != BSDF::ENull;
+
+            /* Prevent light leaks due to the use of shading normals */
+            const Vector wo = its.toWorld(bRec.wo);
+            Float woDotGeoN = dot(its.geoFrame.n, wo);
+            if (m_strictNormals && woDotGeoN * Frame::cosTheta(bRec.wo) <= 0)
+                break;
+
+            bool hitEmitter = false;
+            Spectrum value;
+
+            /* Trace a ray in this direction */
+            ray = Ray(its.p, wo, ray.time);
+            if (scene->rayIntersect(ray, its)) {
+                /* Intersected something - check if it was a luminaire */
+                if (its.isEmitter()) {
+                    value = its.Le(-ray.d);
+                    dRec.setQuery(ray, its);
+                    hitEmitter = true;
+                }
+            } else {
+                /* Intersected nothing -- perhaps there is an environment map? */
+                const Emitter *env = scene->getEnvironmentEmitter();
+
+                if (env) {
+                    if (m_hideEmitters && !scattered)
+                        break;
+
+                    value = env->evalEnvironment(ray);
+                    if (!env->fillDirectSamplingRecord(dRec, ray))
+                        break;
+                    hitEmitter = true;
+                } else {
+                    break;
+                }
+            }
+
+            /* Keep track of the throughput and relative
+               refractive index along the path */
+            throughput *= bsdfWeight;
+            eta *= bRec.eta;
+
+            /* If a luminaire was hit, estimate the local illumination and
+               weight using the power heuristic */
+            if (hitEmitter &&
+                (rRec.type & RadianceQueryRecord::EDirectSurfaceRadiance)) {
+                /* Compute the prob. of generating that direction using the
+                   implemented direct illumination sampling technique */
+                const Float lumPdf = (!(bRec.sampledType & BSDF::EDelta)) ?
+                    scene->pdfEmitterDirect(dRec) : 0;
+                Li += throughput * value * miWeight(bsdfPdf, lumPdf);
+            }
+
+            /* ==================================================================== */
+            /*                         Indirect illumination                        */
+            /* ==================================================================== */
+
+            /* Set the recursive query type. Stop if no surface was hit by the
+               BSDF sample or if indirect illumination was not requested */
+            if (!its.isValid() || !(rRec.type & RadianceQueryRecord::EIndirectSurfaceRadiance))
+                break;
+            rRec.type = RadianceQueryRecord::ERadianceNoEmission;
+
+            } //~EPT
+            // VPT
+            else {
+                // VPT
+                ray.o = ray.o + its.t*ray.d;
+
+                double theta = (1.0*random()/RAND_MAX - 0.5) * M_PI; // -pi/2 ~ pi/2
+                double phi = (1.0*random()/RAND_MAX - 0.5) * M_PI; // -pi/2 ~ pi/2
+                ray.d = normalize(Vector(cos(phi)*cos(theta), sin(phi), -cos(phi)*sin(theta)));
+                Point out = ray.o + ray.d;
+
+                /* Trace a ray in this direction */
+                ray = Ray(out, ray.d, ray.time);
+
+                ray.mint = 0;
+                scene->rayIntersect(ray, its);
+                //nullChain = false;
+                scattered = true;
+            } //~VPT
+
+
+            if (rRec.depth++ >= m_rrDepth) {
+                /* Russian roulette: try to keep path weights equal to one,
+                   while accounting for the solid angle compression at refractive
+                   index boundaries. Stop with at least some probability to avoid
+                   getting stuck (e.g. due to total internal reflection) */
+
+                Float q = std::min(throughput.max() * eta * eta, (Float) 0.95f);
+                if (rRec.nextSample1D() >= q)
+                    break;
+                throughput /= q;
+            }
+        }
+
+
+        /* Store statistics */
+        avgPathLength.incrementBase();
+        avgPathLength += rRec.depth;
+
+        return Li;
+    }
+
+    inline Float miWeight(Float pdfA, Float pdfB) const {
+        pdfA *= pdfA;
+        pdfB *= pdfB;
+        return pdfA / (pdfA + pdfB);
+    }
+
+    void serialize(Stream *stream, InstanceManager *manager) const {
+        MonteCarloIntegrator::serialize(stream, manager);
+    }
+
+    std::string toString() const {
+        std::ostringstream oss;
+        oss << "MultiScale[" << endl
+            << "  maxDepth = " << m_maxDepth << "," << endl
+            << "  rrDepth = " << m_rrDepth << "," << endl
+            << "  strictNormals = " << m_strictNormals << endl
+            << "]";
+        return oss.str();
+    }
+
+    MTS_DECLARE_CLASS()
+};
+
+
+
+
+
+
+#if 0
 class MultiScale : public MonteCarloIntegrator {
 public:
     MultiScale(const Properties &props) : MonteCarloIntegrator(props) { }
@@ -52,11 +296,6 @@ public:
         std::vector<Point> spheres;
         std::vector<int> spheres_indeces;
         std::vector<Point> origins;
-        std::vector<Float> tts;
-        std::vector<Float> tts2;
-        std::vector<Point> gotint;
-        std::vector<Point> outs;
-        std::vector<Point> outs2;
 
 
         std::string logss;
@@ -122,10 +361,12 @@ public:
 
 
 
-            Li += throughput * its.color;
+            Li += throughput * its.color * 0.1;
 
-            IntersectedSphereInfo* info = static_cast<IntersectedSphereInfo*>(its.temp);
+            // EPT
+            GrainIntersectionInfo* info = static_cast<GrainIntersectionInfo*>(its.temp);
 
+#if 0
             {
                 gotint.push_back(Point(info->ix, info->iy, info->iz));
                 origins.push_back(Point(info->ox, info->oy, info->oz));
@@ -138,7 +379,27 @@ public:
                 if(0 & OUTPUT_CONDITION)
                     Log(EWarn, "temppppp:%f, %f, %f, %f", info->center.x, info->center.y, info->center.z, info->radius);
             }
+#endif
 
+
+#if 0
+            // VPT
+            ray.o = ray.o + its.t*ray.d;
+
+            double theta = (1.0*random()/RAND_MAX - 0.5) * M_PI; // -pi/2 ~ pi/2
+            double phi = (1.0*random()/RAND_MAX - 0.5) * M_PI; // -pi/2 ~ pi/2
+            ray.d = normalize(Vector(cos(phi)*cos(theta), sin(phi), -cos(phi)*sin(theta)));
+            Point out = ray.o + ray.d;
+
+            /* Trace a ray in this direction */
+            ray = Ray(out, ray.d, ray.time);
+
+            ray.mint = 0;
+            scene->rayIntersect(ray, its);
+            nullChain = false;
+            scattered = true;
+
+#endif
 
 
             Point intersectionPoint = ray.o + rRec.its.t * ray.d;
@@ -149,6 +410,9 @@ public:
                     * ray.d;
 
 
+            Normal n = its.geoFrame.n;
+            ray.d = -2 * dot(ray.d, normalize(n)) * normalize(n) + ray.d;
+
             /* Trace a ray in this direction */
             ray = Ray(out, ray.d, ray.time);
             //ray = Ray(mRec.p, pRec.wo, ray.time);
@@ -156,7 +420,6 @@ public:
             scene->rayIntersect(ray, its);
             nullChain = false;
             scattered = true;
-
 
 
 
@@ -357,7 +620,7 @@ public:
 
 
 
-
+#if 0
         if(0 && iid%1000==0 & trajectory.size()>1){
             std::stringstream ss;
             ss<<"\n";
@@ -367,18 +630,13 @@ public:
             ss<<"=============\n";
             Point p;
             for(int i=0; i<trajectory.size(); i++) {
-                p = gotint.at(i);
-                ss<<p.x<<", "<< p.y<<", "<< p.z<<"\n";
                 p = trajectory.at(i);
                 ss<<p.x<<", "<< p.y<<", "<< p.z<<" || ";
-                //ss<<p.x<<", "<< p.y<<", "<< p.z<<"\n";
-                ss<<spheres.at(i).x<<", "<<spheres.at(i).y<<", "<<spheres.at(i).z<<" || "<<spheres_indeces.at(i)<<"\n";
-                ss<<origins.at(i).x<<", "<<origins.at(i).y<<", "<<origins.at(i).z<<", t: "<<tts.at(i)<<"\n";
-                //Log(EWarn, "itssssss: %f, %f, %f\n", its.p.x, its.p.y, its.p.z);
             }
             ss<<"=============\n";
             Log(EWarn, ss.str().c_str());
         }
+#endif
 
         return Li;
     }
@@ -400,6 +658,7 @@ public:
     MTS_DECLARE_CLASS()
 };
 
+#endif
 
 
 
