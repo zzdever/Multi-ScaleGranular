@@ -18,7 +18,7 @@ int main(int argc, char **argv) {
 			
 	struct SpherePack::Sphere* spherePack = (struct SpherePack::Sphere*)spherePacks[0];
 	
-	const unsigned int N = 80;
+	const unsigned int N = m_packCount;
 	vector<FastBVH::Object*> objects, objects_bak;
 	printf("Constructing %d spheres...\n", N);
 	for(size_t i=0; i<N; ++i) {
@@ -30,6 +30,7 @@ int main(int argc, char **argv) {
 	BVH bvh(&objects);
 	
 	
+	/*
 	Vector3 center = Vector3(0.6762580508707393, 0.4620289160344975, 0.1241752283957101);
 	
 	Vector3 dir = Vector3(10,50,0.2285823979034143+0.000001);
@@ -61,6 +62,7 @@ int main(int argc, char **argv) {
 	
 	
 	return 0;
+	*/
 	
 	
 

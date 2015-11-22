@@ -46,21 +46,21 @@ struct SphereIntersectionInfo{
 
 class SpherePackDict{
 public:
-    SpherePackDict(){
+    SpherePackDict() {
         control_timer = new Timer();
 
         m_dictCount = sizeof(spherePacks) / sizeof(spherePacks[0]);
-        m_packCount = sizeof(spherePacks[0]) / sizeof(struct SpherePack::Sphere);
+        m_sphereCount = sizeof(spherePacks[0]) / sizeof(struct SpherePack::Sphere);
 
         for(int i=0; i<m_dictCount; i++){
-            BVHInterface* bvhInterface = new BVHInterface((struct SpherePack::Sphere*)spherePacks[i], m_packCount);
+            BVHInterface* bvhInterface = new BVHInterface((struct SpherePack::Sphere*)spherePacks[i], m_sphereCount);
             m_spherePacks.push_back(bvhInterface);
         }
     }
 
-    inline bool rayIntersect(const Ray& ray, SphereIntersectionInfo &info) {
-        // TODO which sample = f(x, y, z)
-        int dictIndex = 0;
+    inline bool rayIntersect(int coord, const Ray& ray, SphereIntersectionInfo &info) {
+        // which dict = f(x, y, z)
+        int dictIndex = getDictType(coord);
 
         SpherePack::Sphere* sphere = (m_spherePacks.at(dictIndex))
                 ->rayIntersect(ray.o, Point(ray.d.x, ray.d.y, ray.d.z), info.I);
@@ -73,13 +73,50 @@ public:
         return NULL != sphere;
     }
 
-    // void boundingSphereExit()
+    int getDictType(int coord) {
+        srand(coord);
+        return rand() % m_dictCount;
+    }
+
+    int getGrainType(int coord, int sphereIndex) {
+        long res = 0;
+        srand(coord);
+        res += rand();
+        srand(getDictType(coord));
+        res += rand();
+        srand(sphereIndex);
+        res += rand();
+        return res % m_grainCount;
+    }
+
+    Transform getGrainTransform(int coord, int sphereIndex) {
+        int rotate;
+        Transform tr;
+        srand(coord);
+        srand(rand() + getDictType(coord));
+        srand(rand() + sphereIndex);
+
+        // x
+        rotate = rand() % 360;
+        tr = tr.rotate(Vector(1,0,0), rotate);
+        // y
+        rotate = rand() % 360;
+        tr = tr.rotate(Vector(0,1,0), rotate);
+        // z
+        rotate = rand() % 360;
+        tr = tr.rotate(Vector(0,0,1), rotate);
+
+        return tr;
+    }
+
+    void setGrainCount(int count) { m_grainCount = count; }
 
 private:
     ref<Timer> control_timer;
 
     int m_dictCount;
-    int m_packCount;
+    int m_sphereCount;
+    int m_grainCount;
     std::vector<BVHInterface*> m_spherePacks;
 };
 
@@ -208,9 +245,15 @@ std::cout<<"[";
 
     }
 
-    inline bool rayIntersect(const Ray &_ray, hitInfo *info) {
-        float t = 1.0/0.0, tmin = 0.;
-        return m_kdtree->hit(_ray, t, tmin, info);
+    inline bool rayIntersect(Transform tr, const Ray &_ray, hitInfo *info) {
+        float tout = 1.0/0.0, tmin = 0.;
+        Ray ray = tr.transformAffine(_ray);
+        bool res = m_kdtree->hit(ray, tout, tmin, info);
+        if(res) {
+            info->hitPoint = tr.inverse().transformAffine(ray.o + ((Float)tout) * ray.d);
+            return true;
+        }
+        return false;
     }
 
 private:
@@ -513,6 +556,8 @@ public:
         if(m_grainMeshCount < 1)
             Log(EError, "No grain mesh!");
 
+        m_spherePackDict->setGrainCount(m_grainMeshCount);
+
         for (int i=0; i<m_grainMeshCount; i++) {
             std::stringstream ss;
             ss<<"grain"<<i;
@@ -605,6 +650,7 @@ public:
         Log(EInfo, "Grid span: %f %f %f", gridSpan.x, gridSpan.y, gridSpan.z);
         Log(EInfo, "mesh aabb:\n%s", m_aabb.toString().c_str());
         Log(EInfo, "volume aabb:\n%s", m_volume_aabb.toString().c_str());
+
 
 
 
@@ -809,13 +855,15 @@ public:
                 bool test_sphere = true;
 
                 // test voxel. voxel empty? full? half-empty?
-                int occupy = (int)m_voxels[x * m_dimensionY * m_dimensionZ + z * m_dimensionY + y];
+                int voxelIndex = x * m_dimensionY * m_dimensionZ + z * m_dimensionY + y;
+                int occupy = (int)m_voxels[voxelIndex];
                 if(occupy == 0)
                     test_sphere = false;
 
                 while(test_sphere) {
                     // test sphere
                     if(! m_spherePackDict->rayIntersect(
+                            voxelIndex,
                             // transform into the unit voxel coordinate
                             Ray(Point((ray.o.x - aabb.min.x) / gridSpan.x - x,
                                       (ray.o.y - aabb.min.y) / gridSpan.y - y,
@@ -834,8 +882,7 @@ public:
                     bool test_grain = true;
                     // half-empty
                     if(occupy == 2) {
-                        if(m_mesh_kdtree->isPointInside(center))
-                        {
+                        if(m_mesh_kdtree->isPointInside(center)) {
                             ; //test_grain = true;
                         }
                         else
@@ -845,32 +892,34 @@ public:
                     // test grain mesh
                     if(test_grain) {
                         hitInfo hitinfo;
-                        bool res = ((Grain*)m_grains.at(0))->rayIntersect( // TODO, grain index
+                        Transform transform = m_spherePackDict->getGrainTransform(voxelIndex, info.index);
+                        bool res = ((Grain*)m_grains.at(m_spherePackDict->getGrainType(voxelIndex, info.index)))->rayIntersect(
+                                    transform,
                                     // transform into the unit sphere
                                     Ray(Point(ray.o.x-center.x, ray.o.y-center.y, ray.o.z-center.z) / (sphere->r * gridSpan.x), ray.d, ray.time),
                                     &hitinfo
                                     );
 
-
                         if(res) {
                             Point hitPoint;
-                            hitPoint.x = (info.I.hit.x + x) * gridSpan.x + aabb.min.x;
-                            hitPoint.y = (info.I.hit.y + y) * gridSpan.y + aabb.min.y;
-                            hitPoint.z = (info.I.hit.z + z) * gridSpan.z + aabb.min.z;
+                            hitPoint.x = hitinfo.hitPoint.x * gridSpan.x * sphere->r + center.x;
+                            hitPoint.y = hitinfo.hitPoint.y * gridSpan.y * sphere->r + center.y;
+                            hitPoint.z = hitinfo.hitPoint.z * gridSpan.z * sphere->r + center.z;
 
                             // actually, they are almost the same
                             t = fmin(fmin((hitPoint.x - rayOrigin.x) / ray.d.x, (hitPoint.y - rayOrigin.y) / ray.d.y), (hitPoint.z - rayOrigin.z) / ray.d.z);
 
-                            // init the temp space, MTS_KD_INTERSECTION_TEMP-4 bytes
-                            new(temp) GrainIntersectionInfo;
-                            GrainIntersectionInfo* tempinfo = static_cast<GrainIntersectionInfo*>(temp);
-                            tempinfo->valid = true;
-                            tempinfo->rendermode = EPT;
-                            tempinfo->object = hitinfo.hitObject;
+                            if(temp){
+                                // init the temp space, MTS_KD_INTERSECTION_TEMP-4 bytes
+                                new(temp) GrainIntersectionInfo;
+                                GrainIntersectionInfo* tempinfo = static_cast<GrainIntersectionInfo*>(temp);
+                                tempinfo->valid = true;
+                                tempinfo->rendermode = EPT;
+                                tempinfo->object = hitinfo.hitObject;
+                                tempinfo->tr = transform;
+                            }
 
                             return true;
-
-                            // TODO transform back if intersect
                         }
                     }
 
@@ -933,10 +982,12 @@ public:
         // VPT
         else if(VPT == m_mode) {
 
-            new(temp) GrainIntersectionInfo;
-            GrainIntersectionInfo* tempinfo = static_cast<GrainIntersectionInfo*>(temp);
-            tempinfo->valid = false;
-            tempinfo->rendermode = VPT;
+            if(temp) {
+                new(temp) GrainIntersectionInfo;
+                GrainIntersectionInfo* tempinfo = static_cast<GrainIntersectionInfo*>(temp);
+                tempinfo->valid = false;
+                tempinfo->rendermode = VPT;
+            }
 
             Point center = ray.o;
             if(m_mesh_kdtree->isPointInside(center))
@@ -964,6 +1015,7 @@ public:
         else {
             hitInfo hitinfo;
             bool res = ((Grain*)m_grains.at(0))->rayIntersect( // TODO, grain index
+                        Transform(),
                         // transform into the unit sphere
                         Ray(Point(ray.o.x, ray.o.y - gridSpan.y, ray.o.z) / (500.0), ray.d, ray.time),
                         &hitinfo
@@ -971,11 +1023,14 @@ public:
 
             if(res) {
                 t = 1.0;
-                new(temp) GrainIntersectionInfo;
-                GrainIntersectionInfo* tempinfo = (GrainIntersectionInfo*)temp;
-                tempinfo->valid = true;
-                tempinfo->rendermode = DEBUG;
-                tempinfo->object = hitinfo.hitObject;
+
+                if(temp) {
+                    new(temp) GrainIntersectionInfo;
+                    GrainIntersectionInfo* tempinfo = (GrainIntersectionInfo*)temp;
+                    tempinfo->valid = true;
+                    tempinfo->rendermode = DEBUG;
+                    tempinfo->object = hitinfo.hitObject;
+                }
 
                 return true;
                 }
@@ -989,11 +1044,24 @@ public:
         Ray ray;
         m_worldToObject(_ray, ray);
 
+        if(EPT == m_mode) {
+            Float t;
+            return rayIntersect(_ray, mint, maxt, t, NULL);
+        }
+        else if(VPT == m_mode) {
+            ;
+        }
+        else if(DA == m_mode) {
+            ;
+        }
+        else {
+            ;
+        }
+
+        /*
         float tout;
         return m_mesh_kdtree->hit(ray, tout, mint);
-
-        //Float t;
-        //return rayIntersect(_ray, mint, maxt, t, NULL);
+        */
 
         return false;        
     }
@@ -1008,11 +1076,13 @@ public:
         if(tempinfo->valid) {
             grain::KDTriangle* kdtriangle = static_cast<grain::KDTriangle*>(tempinfo->object);
 
+            Transform tr = tempinfo->tr.inverse();
+
             its.uv = kdtriangle->getUV();
             its.shape = this;
-            TangentSpace tangentSpace = kdtriangle->getUVTangent();
-            its.dpdu = m_objectToWorld(tangentSpace.dpdu);
-            its.dpdv = m_objectToWorld(tangentSpace.dpdv);
+            TangentSpace tangentSpace = kdtriangle->getUVTangent(); // TODO transform
+            its.dpdu = m_objectToWorld(tr(tangentSpace.dpdu));
+            its.dpdv = m_objectToWorld(tr(tangentSpace.dpdv));
             its.geoFrame.s = normalize(its.dpdu);
             its.geoFrame.t = normalize(its.dpdv);
             its.geoFrame.n = Normal(cross(its.geoFrame.s, its.geoFrame.t));

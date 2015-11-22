@@ -18,6 +18,8 @@ struct GrainIntersectionInfo{
     MODES_T rendermode;
     void* object;
 
+    Transform tr;
+
     Float radius;
     Float x;
     Float y;
@@ -27,6 +29,7 @@ struct GrainIntersectionInfo{
 
 struct hitInfo{
     void * hitObject;
+    Point hitPoint;
 };
 
 MTS_NAMESPACE_END
