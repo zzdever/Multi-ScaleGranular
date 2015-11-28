@@ -1,3 +1,7 @@
+#ifndef BVH_INTERFACE_H
+#define BVH_INTERFACE_H
+
+#include <mitsuba/core/plugin.h>
 
 #include <vector>
 
@@ -7,8 +11,7 @@
 
 #include "sphere_pack.h"
 
-using std::vector;
-using namespace FastBVH;
+MTS_NAMESPACE_BEGIN
 
 class BVHInterface{
 public:
@@ -38,6 +41,7 @@ public:
         if (! bvh->getIntersection(ray, &I, false))
             return NULL;
 
+        /*
         // is the origin in a sphere?
         if(length(o - static_cast<const Sphere*>(I.object)->center) <= m_spherePack[0].d/2.0) {
             o = o + I.t * d;
@@ -47,12 +51,10 @@ public:
         ray.o = o;
         if (! bvh->getIntersection(ray, &I, false))
             return NULL;
+            */
 
         if(I.t <= 0)
             return NULL;
-
-        //printf("fbvh:ooo: %f, %f, %f\n fbvh:ddd: %f, %f, %f\n fbvh:hit: %f, %f, %f\n",
-               //o.x, o.y, o.z, d.x, d.y, d.z, I.hit.x, I.hit.y, I.hit.z);
 
         for(size_t i=0; i<N; ++i) {
             if(objects_bak.at(i) == I.object)
@@ -66,7 +68,7 @@ private:
     BVH *bvh;
     struct SpherePack::Sphere* m_spherePack;
     unsigned int N;
-    vector<FastBVH::Object*> objects, objects_bak;
+    std::vector<FastBVH::Object*> objects, objects_bak;
 };
 
 
@@ -85,4 +87,8 @@ int main(int argc, char **argv) {
         }
     }
 }
+#endif
+
+MTS_NAMESPACE_END
+
 #endif

@@ -1,7 +1,10 @@
-#include <mitsuba/core/plugin.h>
 
 #ifndef TEMPINFO_H
 #define TEMPINFO_H
+
+#include <mitsuba/core/plugin.h>
+#include "bvhinterface.h"
+
 
 MTS_NAMESPACE_BEGIN
 
@@ -9,28 +12,36 @@ typedef enum {
     EPT,
     VPT,
     DA,
+    SCATTEROMETER,
     DEBUG
 } MODES_T;
 
+struct SphereIntersectionInfo{
+    FastBVH::IntersectionInfo I;
+    SpherePack::Sphere* sphere;
+    int index;
+};
 
 struct GrainIntersectionInfo{
-    bool valid;
     MODES_T rendermode;
-    void* object;
 
-    Transform tr;
+    const Shape* shape;
 
-    Float radius;
-    Float x;
-    Float y;
-    Float z;
-    Float w;
+    Point2 uv;
+    Normal n;
+    Vector dpdu, dpdv;
 };
+
+
+
+
 
 struct hitInfo{
     void * hitObject;
     Point hitPoint;
+    Float u,v;
 };
+
 
 MTS_NAMESPACE_END
 

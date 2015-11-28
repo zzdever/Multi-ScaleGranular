@@ -19,30 +19,26 @@
 #include "grainmesh/sphere_pack_data.h"
 
 #include "grainmesh/grainmesh_kdtree.h"
+
 #include "grainmesh/bvhinterface.h"
 
 #include "grainmesh/tempinfo.h"
 
 
-typedef unsigned char byte;
+#include "../medium/homogeneous.h"
+#include "../phase/hg.h"
 
-MTS_NAMESPACE_BEGIN
 
 #define OUTPUT_CONDITION (control_timer->getMicroseconds()%10000 == 0)
 
 #define TEST 0
-
-
 #if !TEST
 
 
-struct SphereIntersectionInfo{
-    FastBVH::IntersectionInfo I;
-    SpherePack::Sphere* sphere;
-    int index;
-    // mesh
-};
 
+MTS_NAMESPACE_BEGIN
+
+typedef unsigned char byte;
 
 class SpherePackDict{
 public:
@@ -56,10 +52,13 @@ public:
             BVHInterface* bvhInterface = new BVHInterface((struct SpherePack::Sphere*)spherePacks[i], m_sphereCount);
             m_spherePacks.push_back(bvhInterface);
         }
+
+        m_sphereR = spherePacks[0][0].d / 2.0;
+        m_packingRate = m_sphereCount * (4.0/3.0*M_PI*m_sphereR*m_sphereR*m_sphereR);
     }
 
     inline bool rayIntersect(int coord, const Ray& ray, SphereIntersectionInfo &info) {
-        // which dict = f(x, y, z)
+        // which dict = f(x, y, z), deterministic
         int dictIndex = getDictType(coord);
 
         SpherePack::Sphere* sphere = (m_spherePacks.at(dictIndex))
@@ -111,21 +110,35 @@ public:
 
     void setGrainCount(int count) { m_grainCount = count; }
 
+    Float getPackingRate() { return m_packingRate; }
+    Float getSphereR() { return m_sphereR; }
+
 private:
     ref<Timer> control_timer;
 
     int m_dictCount;
     int m_sphereCount;
     int m_grainCount;
+
+    Float m_packingRate;
+    Float m_sphereR;
+
     std::vector<BVHInterface*> m_spherePacks;
 };
 
+class Scatterometer : public Scene{
+public:
+    void addShape(Shape *shape) {
+        Scene::addShape(shape);
+    }
+};
 
-class Grain {
+class Grain : public Shape{
 public:
     grain::KDNode* m_kdtree;
+    ref<ShapeKDTree> m_shapeKDTree;
 
-    Grain(std::vector<grain::KDTriangle*>& triangels) {
+    Grain(std::vector<grain::KDTriangle*>& triangels) : Shape(Properties()) {
         for(size_t i=0; i<triangels.size(); i++) {
             m_triangles.push_back(triangels.at(i));
         }
@@ -160,28 +173,114 @@ public:
         }
 
         m_kdtree = new grain::KDNode(m_triangles);
-        //m_aabb = m_kdtree->bbox;
+    }
+
+    Grain(std::vector<TriMesh*>& meshes) : Shape(Properties()){
+        // get a bounding box surrounding all the triangles
+        AABB aabb;
+        for(size_t i=0; i<meshes.size(); i++) {
+            aabb.expandBy(meshes.at(i)->getAABB());
+        }
+
+        // find the furthest vertex from sphere center
+        Point midPoint = (aabb.min + aabb.max)/2.0;
+        Float minD = 0.0, tmpD;
+
+        for(size_t i=0; i<meshes.size(); i++) {
+            Point* positions = meshes.at(i)->getVertexPositions();
+            int count = (meshes.at(i))->getVertexCount();
+
+            for(size_t j=0; j<count; j++) {
+                tmpD = distance(midPoint, positions[j]);
+                if(tmpD > minD) {
+                    minD = tmpD;
+                }
+            }
+        }
+
+        // scale to a box inscribed inside a unit sphere
+        Point translate = (aabb.min + aabb.max)/(-2.0);
+        Float scale = 1.0 / minD;
+
+        for(size_t i=0; i<meshes.size(); i++) {
+            Point* positions = meshes.at(i)->getVertexPositions();
+            int count = (meshes.at(i))->getVertexCount();
+
+            for(size_t j=0; j<count; j++) {
+                positions[j] = (positions[j] + translate) * scale;
+            }
+        }
+
+        // build kd-tree
+        m_shapeKDTree = new ShapeKDTree();
+        for(size_t i=0; i<meshes.size(); i++) {
+            m_shapeKDTree->addShape(meshes.at(i));
+        }
+        m_shapeKDTree->build();
+
+        m_aabb = m_shapeKDTree->getAABB();
+        m_meshes = meshes;
+
+        OUTPUT_DATA = true;
+        SAMPLE_NUM = 10;
     }
 
     void precomputeTSDF() {
-        const int SAMPLE_NUM = 10;
         long hitCount = 0;
 
-        Ray ray;
-        ray.o = Point(-1.0, 0, 0);
+        Point origin;
+        Vector dir;
 
         Float coord_theta, coord_phi, theta, phi;
         Vector coord_x, coord_y, coord_z;
-        hitInfo hitinfo;
+        //hitInfo hitinfo;
+        //Intersection its;
 
-std::cout<<"[";
+
+        // setup the scene
+        PluginManager *pluginManager = PluginManager::getInstance();
+
+        /* scatterometer scene */
+        ref<Scatterometer> scatterometer = new Scatterometer();
+        scatterometer->incRef();
+
+        /* shape */
+        ref<Shape> shape = static_cast<Shape*> (this);
+        shape->incRef();
+        shape->configure();
+        scatterometer->addShape(shape.get());
+
+        /* integrator */
+        Properties integratorProp("multiscale");
+        integratorProp.setInteger("maxDepth", 8);
+        ref<SamplingIntegrator> integrator = static_cast<SamplingIntegrator*> (
+                    pluginManager->createObject(MTS_CLASS(Integrator), Properties(integratorProp)));
+        integrator->incRef();
+        integrator->configure();
+        scatterometer->setIntegrator(integrator.get());
+
+        /* sampler */
+        ref<Sampler> sampler = static_cast<Sampler*> (
+                    pluginManager->createObject(MTS_CLASS(Sampler), Properties("independent")));
+        sampler->incRef();
+        sampler->configure();
+        scatterometer->setSampler(sampler.get());
+
+        scatterometer->initialize();
+        scatterometer->configure();
+
+
+        fs::ofstream is(fs::path("/Users/ying/grainstatics.py"));
+        if(OUTPUT_DATA) {
+            is<<"data = [";
+        }
 
         // uniformly sample origin, on sphere
         for(int i=0; i<SAMPLE_NUM; i++) {
             coord_theta = (2.0*random()/RAND_MAX - 1.0) * M_PI; // -pi ~ pi
             coord_phi = (1.0*random()/RAND_MAX - 0.5) * M_PI; // -pi/2 ~ pi/2
-            ray.o = (Point(cos(coord_phi)*cos(coord_theta), sin(coord_phi), -cos(coord_phi)*sin(coord_theta)));
-            coord_x = Point(0,0,0) - ray.o;
+            origin = (Point(cos(coord_phi)*cos(coord_theta), sin(coord_phi), -cos(coord_phi)*sin(coord_theta)));
+            coord_x = Point(0,0,0) - origin;
             coord_z = normalize(cross(coord_x, Vector(0,1,0)));
             coord_y = normalize(cross(coord_z, coord_x));
 
@@ -190,30 +289,59 @@ std::cout<<"[";
                         coord_x.z, coord_y.z, coord_z.z, 0,
                         0, 0, 0, 1);
 
+
+            //origin = Point(warp::squareToUniformSphere(Point2((Float)(1.0*random()/RAND_MAX), (Float)(1.0*random()/RAND_MAX))));
+
             // uniformly sample direction, on hemi-sphere
             for(int j=0; j<SAMPLE_NUM; j++) {
                 theta = (1.0*random()/RAND_MAX - 0.5) * M_PI; // -pi/2 ~ pi/2
                 phi = (1.0*random()/RAND_MAX - 0.5) * M_PI; // -pi/2 ~ pi/2
-                ray.d = normalize(Vector(cos(phi)*cos(theta), sin(phi), -cos(phi)*sin(theta)));
-                Vector4 tmpd = m*Vector4(ray.d.x, ray.d.y, ray.d.z, 1);
-                ray.d = normalize(Vector(tmpd.x, tmpd.y, tmpd.z));
+                dir = normalize(Vector(cos(phi)*cos(theta), sin(phi), -cos(phi)*sin(theta)));
+                Vector4 tmpd = m*Vector4(dir.x, dir.y, dir.z, 1);
+                dir = normalize(Vector(tmpd.x, tmpd.y, tmpd.z));
 
+                //dir = normalize(warp::squareToUniformHemisphere(Point2((Float)(1.0*random()/RAND_MAX), (Float)(1.0*random()/RAND_MAX))));
+
+                /*
                 float tout=1.0/0.0, tmin=-0.;
                 Float t;
                 if(! m_kdtree->hit(ray, tout, tmin, &hitinfo))
                     continue;
+                t = its.t;
+                */
+
+                /*
+                Ray ray(origin, dir, (Float)0);
+                ray.mint = 0.;
+                if(! m_shapeKDTree->rayIntersect(ray, its))
+                    continue;
+                */
+
+                RayDifferential ray(origin + dir * (-1.)/* pull the tay back out of the AABB */, dir, (Float)0);
+                RadianceQueryRecord rRec(scatterometer.get(), sampler.get());
+                rRec.type = RadianceQueryRecord::ESensorRay;
+
+                /* Perform a scene intersection */
+                integrator->Li(ray, rRec);
+
+                if(! rRec.its.isValid())
+                    continue;
 
                 // hit
-                t = (Float)tout;
                 hitCount++;
 
+                /*
                 Normal n = static_cast<grain::KDTriangle*>(hitinfo.hitObject)->getNormal();
                 Point hit = ray.o + t*ray.d;
                 Vector outd = normalize(-2 * dot(ray.d, normalize(n)) * normalize(n) + ray.d);
+                */
+
+                Vector outd = normalize(rRec.its.wi);
 
                 // cos(theta)
-                Float cosTheta = dot(ray.d, outd);
+                Float cosTheta = dot(dir, outd);
 
+                /*
                 double A = outd.x*outd.x + outd.y*outd.y + outd.z*outd.z;
                 double B = 2*(hit.x*outd.x + hit.y*outd.y + hit.z*outd.z);
                 double C = hit.x*hit.x + hit.y*hit.y + hit.z*hit.z - 1.0;
@@ -234,15 +362,25 @@ std::cout<<"[";
                 double phi = acos((double)dot(outdProjection, Vector(0,1,0))) * 180 / M_PI;
                 if(dot(coord_z, outdProjection) < 0)
                     phi = 360 - phi;
+                */
 
-
-                //std::cout<<"("<<(float)cosTheta<<", "<<r<<", "<<z<<", "<<phi<<"), ";
+                if(OUTPUT_DATA) {
+                    is<<"("<<(float)cosTheta<<", "<<0<<", "<<0<<", "<<0<<"), ";
+                }
             }
         }
 
-        std::cout<<"]"<<std::endl;
-        std::cout<<"hit probability: "<<hitCount * 1.0 / (SAMPLE_NUM*SAMPLE_NUM)<<std::endl;
+        shape->decRef();
+        integrator->decRef();
+        sampler->decRef();
+        scatterometer->decRef();
 
+
+        if(OUTPUT_DATA) {
+            is<<"]"<<std::endl;
+            std::cout<<"hit probability: "<<hitCount * 1.0 / (SAMPLE_NUM*SAMPLE_NUM)<<std::endl;
+            is.close();
+        }
     }
 
     inline bool rayIntersect(Transform tr, const Ray &_ray, hitInfo *info) {
@@ -256,20 +394,126 @@ std::cout<<"[";
         return false;
     }
 
+    /* only used for precomputing */
+    bool rayIntersect(const Ray &_ray, Float mint, Float maxt, Float &t, void *temp) const {
+        Intersection its;
+        bool res = m_shapeKDTree->rayIntersect(_ray, its);
+        if(res) {
+            t = its.t;
+
+            if(temp) {
+                new(temp) GrainIntersectionInfo;
+                GrainIntersectionInfo* grainIntersectionInfo = static_cast<GrainIntersectionInfo*>(temp);
+
+                grainIntersectionInfo->rendermode = SCATTEROMETER;
+                grainIntersectionInfo->uv = its.uv;
+                grainIntersectionInfo->n = (its.shFrame.n);
+                grainIntersectionInfo->dpdu = its.dpdu;
+                grainIntersectionInfo->dpdv = its.dpdv;
+                grainIntersectionInfo->shape = static_cast<const Shape*>(this);
+            }
+        }
+        return res;
+    }
+
+    /* only used for precomputing */
+    bool rayIntersect(const Ray &_ray, Float mint, Float maxt) const {
+        return m_shapeKDTree->rayIntersect(_ray);
+    }
+
+    void fillIntersectionRecord(const Ray &ray,
+            const void *temp, Intersection &its) const {
+        its.p = ray(its.t);
+
+        const GrainIntersectionInfo* tempinfo = static_cast<const GrainIntersectionInfo*>(temp);
+
+        its.uv = tempinfo->uv;
+        its.shape = tempinfo->shape;
+        its.shFrame.n = tempinfo->n;
+        its.geoFrame.n = its.shFrame.n;
+
+        its.hasUVPartials = false;
+        its.instance = NULL;
+        its.time = ray.time;
+
+        its.dpdu = ((tempinfo->dpdu));
+        its.dpdv = ((tempinfo->dpdv));
+        its.geoFrame.s = normalize(its.dpdu);
+        its.geoFrame.t = normalize(its.dpdv);
+
+        its.temp = (void*) temp;
+    }
+
+    /* used for EPT */
+    inline bool rayIntersect(Transform tr, const Ray &_ray, Intersection& its) {
+        Ray ray = tr.transformAffine(_ray);
+        bool res = m_shapeKDTree->rayIntersect(ray, its);
+
+        if(res) {
+            Transform trinv = tr.inverse();
+            its.p = trinv(ray.o + its.t * ray.d);
+            its.shFrame.n = trinv(its.shFrame.n);
+            its.dpdu = trinv(its.dpdu);
+            its.dpdv = trinv(its.dpdv);
+
+            return true;
+        }
+        return false;
+    }
+
+    void setOutputData(bool out) { OUTPUT_DATA = out; }
+
+    void setSampleCount(long count) { SAMPLE_NUM = count; }
+
+    void setName(std::string name) { m_name = name; }
+
+    std::string getName() const { return m_name; }
+
+    const char *GetDescription() { return "Grain"; }
+
+    inline void addChild(ConfigurableObject *child) {
+        const Class *cClass = child->getClass();
+        if (cClass->derivesFrom(MTS_CLASS(BSDF))) {
+            m_bsdf = static_cast<BSDF *>(child);
+            for (size_t i=0; i<m_meshes.size(); i++) {
+                m_meshes.at(i)->addChild(child);
+            }
+        }
+    }
+
+    void getNormalDerivative(const Intersection &its,
+        Vector &dndu, Vector &dndv, bool shadingFrame = true) const
+    {
+        for (size_t i=0; i<m_meshes.size(); i++) {
+            if (m_meshes.at(i) == its.shape) {
+                return m_meshes.at(i)->getNormalDerivative(its, dndu, dndv, shadingFrame);
+            }
+        }
+        Log(EError, "getNormalDerivative query shape not found.");
+    }
+
+    AABB getAABB() const { return m_aabb; }
+    Float getSurfaceArea() const { return 4*M_PI; }
+    size_t getPrimitiveCount() const { return 1; }
+    size_t getEffectivePrimitiveCount() const { return 1; }
+
+    //MTS_DECLARE_CLASS()
+
 private:
     std::vector<grain::KDTriangle*> m_triangles;
-    //AABB m_aabb;
+    std::string m_name;
+    std::vector<TriMesh*> m_meshes;
+    AABB m_aabb;
+
+    bool OUTPUT_DATA;
+    long SAMPLE_NUM;
 };
-
-
 
 
 class GrainMesh : public Shape {
 private:
     Transform m_objectToWorld;
     Transform m_worldToObject;
-    // TODO remove cylinder related
-    Float m_radius, m_length, m_invSurfaceArea;
     int m_aggregateMeshCount, m_grainMeshCount;
 
     // voxel
@@ -280,16 +524,13 @@ private:
     Vector gridSpan; // one voxel size
 
     // kd-tree
-    grain::KDNode *m_mesh_kdtree;
+    //grain::KDNode *m_mesh_kdtree;
+    ref<ShapeKDTree> m_shapeKDTree;
     SpherePackDict *m_spherePackDict;
-
-
     std::vector<Grain*> m_grains;
-    //std::vector<grain::KDTriangle*> m_grainTriangles;
-    //grain::KDNode *m_grain_kdtree;
 
-    // modes
-    MODES_T m_mode;
+    // others
+    MODES_T m_renderMode;
 
     // debug
     ref<Timer> control_timer;
@@ -414,57 +655,51 @@ public:
 
     }
 
-    void extractKDTrianglesFromMeshes(
-            std::vector<TriMesh*> &meshes,
-            std::vector<grain::KDTriangle*> &KDTriangles)
-    {
-        for(size_t i=0; i<meshes.size(); i++)
-        {
-            int count = meshes.at(i)->getTriangleCount();
-            const Triangle* triangles = meshes.at(i)->getTriangles();
-            Point* positions = meshes.at(i)->getVertexPositions();
-            Normal* normals;
-            if(meshes.at(i)->hasVertexNormals())
-                normals = meshes.at(i)->getVertexNormals();
-            Point2* uvs;
-            if(meshes.at(i)->hasVertexTexcoords())
-                uvs = meshes.at(i)->getVertexTexcoords();
 
-            for(size_t j=0; j<count; j++) {
-                grain::KDTriangle *t = new grain::KDTriangle(
-                            positions[triangles[j].idx[0]],
-                            positions[triangles[j].idx[1]],
-                            positions[triangles[j].idx[2]]);
+    /* fill in parameters, etc. for VPT render mode */
+    void VPTSetup() {
+        double f = m_spherePackDict->getPackingRate();
+        double r = m_spherePackDict->getSphereR();
+        double hg_g = 0.7;
+        double lamda_sigma = 0.85;
+        double alpha_s = 0.68;
+        double lamda_s = 0.50;
+        double beta = 0.63;
 
-                if(meshes.at(i)->hasVertexNormals()) {
-                    t->addNormal(normals[triangles[j].idx[0]],
-                                 normals[triangles[j].idx[1]],
-                                 normals[triangles[j].idx[2]]);
-                }
+        double lamda_b = 1.0 / (3*f / (4*r*(1-f)));
+        double lamda_beta = (lamda_b + lamda_sigma) * (1 - beta) / beta + lamda_b;
+        double sigma_t = 1.0 / (lamda_beta + alpha_s * lamda_s);
 
-                if(meshes.at(i)->hasVertexTexcoords()) {
-                    t->addUV(uvs[triangles[j].idx[0]],
-                             uvs[triangles[j].idx[1]],
-                             uvs[triangles[j].idx[2]]);
-                }
+        //double v = 1.0*random()/RAND_MAX;
+        //t = log(1-v) / (-sigma_t) * gridSpan.x / 2;
 
-                KDTriangles.push_back(t);
-            }
-        }
+        Log(EInfo, "VPT parameters. sigmaT: %f, albedo: %f", sigma_t, alpha_s);
+
+        Properties props;
+        props.setSpectrum(std::string("sigmaT"), Spectrum((Float)sigma_t));
+        props.setSpectrum(std::string("albedo"), Spectrum((Float)alpha_s));
+        props.setFloat("g", (Float)hg_g);
+        HomogeneousMedium* interior_medium = new HomogeneousMedium(props);
+        interior_medium->addChild((ConfigurableObject*)(new HGPhaseFunction(props)));
+        addChild(std::string("interior"), (ConfigurableObject*)interior_medium);
+
+        Log(EInfo, "Added medium:\n%s", interior_medium->toString().c_str());
+
     }
 
     GrainMesh(const Properties &props) : Shape(props) {
 
         control_timer = new Timer();
-        m_radius = 1.0, m_length = 2.0;
+
 
         ref<FileResolver> fileResolver = Thread::getThread()->getFileResolver()->clone();
-
 
         // stub
         m_aggregateMeshCount = 1;
         fs::path path = fileResolver->resolve(props.getString("filename"));
+        //m_workingDir = fs::absolute(path).parent_path();
         m_name = path.stem().string();
+
 
         /* By default, any existing normals will be used for
            rendering. If no normals are found, Mitsuba will
@@ -521,13 +756,18 @@ public:
         Log(EInfo, "Done with \"%s\" (took %i ms)", path.filename().string().c_str(), timer->getMilliseconds());
         timer->reset();
 
-
         // Create the mesh KD-Tree for intersection
+        /*
         std::vector<grain::KDTriangle*> allKDTriangles;
         extractKDTrianglesFromMeshes(m_meshes, allKDTriangles);
-
         Log(EInfo, "KD-tree: %d triangles in total", allKDTriangles.size());
         m_mesh_kdtree = new grain::KDNode(allKDTriangles);
+        */
+        m_shapeKDTree = new ShapeKDTree();
+        for(size_t i=0; i<m_meshes.size(); i++) {
+            m_shapeKDTree->addShape(m_meshes.at(i));
+        }
+        m_shapeKDTree->build();
 
         Log(EInfo, "Done build the kd-tree (took %i ms)", timer->getMilliseconds());
         timer->reset();
@@ -575,24 +815,26 @@ public:
             std::vector<std::string> materials;
             loadWavefrontOBJ(meshes, materials, ss.str(), is, fileResolver, m_objectToWorld);
 
-
             // create kd-tree for this grain
+            /*
             std::vector<grain::KDTriangle*> grainTriangles;
             extractKDTrianglesFromMeshes(meshes, grainTriangles);
             m_grains.push_back(new Grain(grainTriangles));
+            */
+            Grain* grain = new Grain(meshes);
+            grain->setOutputData(props.getBoolean("outputGrainData", true));
+            grain->setSampleCount(props.getInteger("precomputeSampleCount", 10));
+            grain->setName(ss.str());
+            grain->incRef();
+            m_grains.push_back(grain);
         }
 
         Log(EInfo, "Loaded %d grain mesh(es) (took %i ms)", m_grainMeshCount, timer->getMilliseconds());
         timer->reset();
 
-        /* precompute TSDF */
-        ((Grain*)m_grains.at(0))->precomputeTSDF();
-        //for(size_t i=0; i<m_grains.size(); i++) {
-          //  ((Grain*)m_grains.at(i))->precomputeTSDF();
-        //}
 
-        Log(EInfo, "Precomputed TSDFs for %d grain mesh(es) (took %i ms)",m_grainMeshCount, timer->getMilliseconds());
-        timer->reset();
+
+
 
 
         // TODO mitsuba::ShapeKDTree kdt;
@@ -602,22 +844,23 @@ public:
         int rendermode = props.getInteger("rendermode", 0);
         switch (rendermode) {
         case 0:
-            m_mode = EPT;
+            m_renderMode = EPT;
             break;
         case 1:
-            m_mode = VPT;
+            m_renderMode = VPT;
             break;
         case 2:
-            m_mode = DA;
+            m_renderMode = DA;
             break;
         default:
-            m_mode = DEBUG;
+            m_renderMode = DEBUG;
             break;
         }
 
 
         simpledebug = props.getBoolean("simpledebug", false);
         if(simpledebug) {
+
             for(int i=0; i<8; i++)
                 m_voxels[i] = 0;
 
@@ -628,6 +871,17 @@ public:
             m_dimensionX = 2;
             m_dimensionY = 2;
             m_dimensionZ = 2;
+
+
+            /*
+            int dim = 8;
+            for(int i=0; i<dim*dim*dim; i++) {
+                m_voxels[i] = 1;
+                m_dimensionX = dim;
+                m_dimensionY = dim;
+                m_dimensionZ = dim;
+            }
+            */
         }
 
     }
@@ -641,6 +895,7 @@ public:
             m_aabb.expandBy(m_meshes[i]->getAABB());
         }
 
+        /* configure AABB */
         // volumeSpan = m_aabb.max - m_aabb.min;
         gridSpan.x = volumeSpan.x / m_dimensionX;
         gridSpan.y = volumeSpan.y / m_dimensionY;
@@ -652,9 +907,113 @@ public:
         Log(EInfo, "volume aabb:\n%s", m_volume_aabb.toString().c_str());
 
 
+        /* setup VPT parameters */
+        VPTSetup();
 
 
 #if 0
+        /* precompute TSDF */
+        Log(EInfo, "Precomputing TSDFs...");
+
+        ref<Timer> timer = new Timer();
+        timer->reset();
+        for(size_t i=0; i<m_grains.size(); i++) {
+          ((Grain*)m_grains.at(i))->precomputeTSDF();
+        }
+
+        Log(EInfo, "Precomputed TSDFs for %d grain mesh(es) (took %i ms)",m_grainMeshCount, timer->getMilliseconds());
+#endif
+
+
+#if 0
+
+        std::cout<<"ppppppppppppp"<<std::endl;
+
+        // setup the scene
+        PluginManager *pluginManager = PluginManager::getInstance();
+
+        /* scatterometer scene */
+        ref<Scatterometer> scatterometer = new Scatterometer();
+
+        /* shape */
+        Properties sphereProp("sphere");
+        sphereProp.setPoint("center", Point(0,0,0));
+        sphereProp.setFloat("radius", 1.f);
+        ref<Shape> shape = static_cast<Shape*> (
+                    pluginManager->createObject(MTS_CLASS(Shape), sphereProp));
+        shape->setBSDF(this->getBSDF());
+        shape->configure();
+        scatterometer->addShape(shape.get());
+
+        /* integrator */
+        Properties integratorProp("multiscale");
+        integratorProp.setInteger("maxDepth", 8);
+        ref<SamplingIntegrator> integrator = static_cast<SamplingIntegrator*> (
+                    pluginManager->createObject(MTS_CLASS(Integrator), Properties(integratorProp)));
+        integrator->configure();
+        scatterometer->setIntegrator(integrator.get());
+
+        /* sampler */
+        ref<Sampler> sampler = static_cast<Sampler*> (
+                    pluginManager->createObject(MTS_CLASS(Sampler), Properties("independent")));
+        sampler->configure();
+        scatterometer->setSampler(sampler.get());
+
+        scatterometer->initialize();
+        scatterometer->configure();
+
+
+        Point oo = Point(0,0,5);
+        int size = 800;
+        for(int i=0; i<size; i++) {
+            for(int j=0; j<size; j++) {
+
+                RayDifferential ray(oo, Point((i-size/2.0)/(size/2.0), (j-size/2.0)/(size/2.0), 2.0)-oo, (Float)0);
+                RadianceQueryRecord rRec(scatterometer.get(), sampler.get());
+                rRec.type = RadianceQueryRecord::ERadiance;
+                rRec.depth = 1;
+
+                /* Perform a scene intersection */
+                Spectrum spectrum = integrator->Li(ray, rRec);
+
+
+                std::cout<<i<<" "<<j<<" "<<spectrum[0]<<" "<<spectrum[1]<<" "<<spectrum[2]<<" "<<std::endl;
+            }
+        }
+
+
+#endif
+
+
+        // TODO determine EPT, VPT, DA
+#if 0
+        const Sensor * sen = getSensor();
+        if(sen) {
+            Vector4 ori= ((const AnimatedTransform*)sen->getWorldTransform())->getTransform().getMatrix().col(3);
+            Point cameraOrigin = Point(ori.x, ori.y, ori.z);
+
+            if(distance(cameraOrigin, (m_volume_aabb.min+m_volume_aabb.max)/2) < 4000) {
+                Log(EWarn, "Using EPT.");
+                m_renderMode = EPT;
+            }
+            else {
+                Log(EWarn, "Using VPT.");
+                m_renderMode = VPT;
+            }
+
+            {
+                m_renderMode = DEBUG;
+                Log(EWarn, "debug, switch to DEBUG");
+            }
+        }
+#endif
+
+
+
+
+
+#if 0
+        // test inside
         AABB aabb = m_volume_aabb;
 
         size_t size = m_dimensionX*m_dimensionY*m_dimensionZ;
@@ -693,66 +1052,6 @@ public:
 
 #endif
 
-
-
-
-        // TODO determine EPT, VPT, DA
-#if 0
-        const Sensor * sen = getSensor();
-        if(sen) {
-            Vector4 ori= ((const AnimatedTransform*)sen->getWorldTransform())->getTransform().getMatrix().col(3);
-            Point cameraOrigin = Point(ori.x, ori.y, ori.z);
-
-            if(distance(cameraOrigin, (m_volume_aabb.min+m_volume_aabb.max)/2) < 4000) {
-                Log(EWarn, "Using EPT.");
-                m_mode = EPT;
-            }
-            else {
-                Log(EWarn, "Using VPT.");
-                m_mode = VPT;
-            }
-
-            {
-                m_mode = DEBUG;
-                Log(EWarn, "debug, switch to DEBUG");
-            }
-        }
-#endif
-
-
-
-
-#if 0
-
-        {
-            std::vector<grain::KDTriangle*> tris;
-
-            tris.push_back(new grain::KDTriangle(
-                               Point(-1,-1,1),
-                               Point(1,-1,1),
-                               Point(0,1,1)
-                               ));
-
-            grain::KDNode* kdtree = new grain::KDNode(tris);
-
-            Point o(0,0,2);
-            Vector d(0,0,-1);
-            Ray ray = Ray(o, d, (Float)0);
-
-            float t=1.0/0.0, tmin=0;
-            bool res = kdtree->hit(ray, t, tmin);
-            if(res)
-                Log(EWarn, "tttttttttttying: %f", t);
-            if(res && t>tmin)
-                Log(EWarn, "tttttttttttying: hit");
-            else
-                Log(EWarn, "tttttttttttying: not hit");
-
-            //exit(0);
-
-        }
-#endif
-
     }
 
     GrainMesh(Stream *stream, InstanceManager *manager) : Shape(stream, manager) {
@@ -773,7 +1072,7 @@ public:
         m_worldToObject(_ray, ray);
 
         // EPT
-        if(EPT == m_mode){
+        if(EPT == m_renderMode){
 
             Point rayOrigin = ray.o;
 
@@ -849,7 +1148,7 @@ public:
             }
 
 
-            SphereIntersectionInfo info;
+            SphereIntersectionInfo sphereIntersectionInfo;
             Vector inc(0,0,0);
             while(1) {
                 bool test_sphere = true;
@@ -869,11 +1168,11 @@ public:
                                       (ray.o.y - aabb.min.y) / gridSpan.y - y,
                                       (ray.o.z - aabb.min.z) / gridSpan.z - z),
                                 ray.d, ray.time),
-                            info))
+                            sphereIntersectionInfo))
                         break;
 
 
-                    const FastBVH::Sphere* sphere = static_cast<const FastBVH::Sphere*>(info.I.object);
+                    const FastBVH::Sphere* sphere = static_cast<const FastBVH::Sphere*>(sphereIntersectionInfo.I.object);
                     Point center;
                     center.x = (sphere->center.x + x) * gridSpan.x + aabb.min.x;
                     center.y = (sphere->center.y + y) * gridSpan.y + aabb.min.y;
@@ -882,7 +1181,12 @@ public:
                     bool test_grain = true;
                     // half-empty
                     if(occupy == 2) {
-                        if(m_mesh_kdtree->isPointInside(center)) {
+                        if(   m_shapeKDTree->rayIntersect(Ray(center, Vector(1,0,0), (Float)0))
+                           && m_shapeKDTree->rayIntersect(Ray(center, Vector(-1,0,0), (Float)0))
+                           && m_shapeKDTree->rayIntersect(Ray(center, Vector(0,1,0), (Float)0))
+                           && m_shapeKDTree->rayIntersect(Ray(center, Vector(0,-1,0), (Float)0))
+                           && m_shapeKDTree->rayIntersect(Ray(center, Vector(0,0,1), (Float)0))
+                           && m_shapeKDTree->rayIntersect(Ray(center, Vector(0,0,-1), (Float)0))) {
                             ; //test_grain = true;
                         }
                         else
@@ -891,20 +1195,36 @@ public:
 
                     // test grain mesh
                     if(test_grain) {
+                        Transform transform = m_spherePackDict->getGrainTransform(voxelIndex, sphereIntersectionInfo.index);
+                        /*
                         hitInfo hitinfo;
-                        Transform transform = m_spherePackDict->getGrainTransform(voxelIndex, info.index);
-                        bool res = ((Grain*)m_grains.at(m_spherePackDict->getGrainType(voxelIndex, info.index)))->rayIntersect(
+                        bool res = ((Grain*)m_grains.at(m_spherePackDict->getGrainType(voxelIndex, sphereIntersectionInfo.index)))->rayIntersect(
                                     transform,
                                     // transform into the unit sphere
                                     Ray(Point(ray.o.x-center.x, ray.o.y-center.y, ray.o.z-center.z) / (sphere->r * gridSpan.x), ray.d, ray.time),
                                     &hitinfo
                                     );
+                        */
+
+                        Intersection its;
+                        Grain* grain = m_grains.at(m_spherePackDict->getGrainType(voxelIndex, sphereIntersectionInfo.index));
+                        bool res = grain->rayIntersect(
+                                    transform,
+                                    // transform into the unit sphere
+                                    Ray(Point(ray.o.x-center.x, ray.o.y-center.y, ray.o.z-center.z) / (sphere->r * gridSpan.x), ray.d, ray.time),
+                                    its
+                                    );
 
                         if(res) {
                             Point hitPoint;
+                            /*
                             hitPoint.x = hitinfo.hitPoint.x * gridSpan.x * sphere->r + center.x;
                             hitPoint.y = hitinfo.hitPoint.y * gridSpan.y * sphere->r + center.y;
                             hitPoint.z = hitinfo.hitPoint.z * gridSpan.z * sphere->r + center.z;
+                            */
+                            hitPoint.x = its.p.x * gridSpan.x * sphere->r + center.x;
+                            hitPoint.y = its.p.y * gridSpan.y * sphere->r + center.y;
+                            hitPoint.z = its.p.z * gridSpan.z * sphere->r + center.z;
 
                             // actually, they are almost the same
                             t = fmin(fmin((hitPoint.x - rayOrigin.x) / ray.d.x, (hitPoint.y - rayOrigin.y) / ray.d.y), (hitPoint.z - rayOrigin.z) / ray.d.z);
@@ -912,11 +1232,14 @@ public:
                             if(temp){
                                 // init the temp space, MTS_KD_INTERSECTION_TEMP-4 bytes
                                 new(temp) GrainIntersectionInfo;
-                                GrainIntersectionInfo* tempinfo = static_cast<GrainIntersectionInfo*>(temp);
-                                tempinfo->valid = true;
-                                tempinfo->rendermode = EPT;
-                                tempinfo->object = hitinfo.hitObject;
-                                tempinfo->tr = transform;
+                                GrainIntersectionInfo* grainIntersectionInfo = static_cast<GrainIntersectionInfo*>(temp);
+                                grainIntersectionInfo->rendermode = EPT;
+
+                                grainIntersectionInfo->uv = its.uv;
+                                grainIntersectionInfo->n = (its.shFrame.n);
+                                grainIntersectionInfo->dpdu = its.dpdu;
+                                grainIntersectionInfo->dpdv = its.dpdv;
+                                grainIntersectionInfo->shape = static_cast<const Shape*>(its.shape);
                             }
 
                             return true;
@@ -925,9 +1248,9 @@ public:
 
                     // skip this sphere. sphere not in aggregate mesh or grain not hit.
                     Point hitPoint;
-                    hitPoint.x = (info.I.hit.x + x) * gridSpan.x + aabb.min.x;
-                    hitPoint.y = (info.I.hit.y + y) * gridSpan.y + aabb.min.y;
-                    hitPoint.z = (info.I.hit.z + z) * gridSpan.z + aabb.min.z;
+                    hitPoint.x = (sphereIntersectionInfo.I.hit.x + x) * gridSpan.x + aabb.min.x;
+                    hitPoint.y = (sphereIntersectionInfo.I.hit.y + y) * gridSpan.y + aabb.min.y;
+                    hitPoint.z = (sphereIntersectionInfo.I.hit.z + z) * gridSpan.z + aabb.min.z;
 
                     ray.o = hitPoint +
                             (2 * (dot(ray.d,
@@ -980,56 +1303,59 @@ public:
             return false;
         }
         // VPT
-        else if(VPT == m_mode) {
+        else if(VPT == m_renderMode) {
+            /*
+            float tout = 1.0/0.0, tmin = 0.;
+            hitInfo hitinfo;
+            bool res = m_mesh_kdtree->hit(ray, tout, tmin, &hitinfo);
+            */
 
-            if(temp) {
+            Intersection its;
+            bool res = m_shapeKDTree->rayIntersect(ray, its);
+
+            if(temp){
+                // init the temp space, MTS_KD_INTERSECTION_TEMP-4 bytes
                 new(temp) GrainIntersectionInfo;
-                GrainIntersectionInfo* tempinfo = static_cast<GrainIntersectionInfo*>(temp);
-                tempinfo->valid = false;
-                tempinfo->rendermode = VPT;
+                GrainIntersectionInfo* grainIntersectionInfo = static_cast<GrainIntersectionInfo*>(temp);
+                grainIntersectionInfo->rendermode = VPT;
+
+                grainIntersectionInfo->uv = its.uv;
+                grainIntersectionInfo->n = its.shFrame.n;
+                grainIntersectionInfo->dpdu = its.dpdu;
+                grainIntersectionInfo->dpdv = its.dpdv;
+                grainIntersectionInfo->shape = this;
             }
 
-            Point center = ray.o;
-            if(m_mesh_kdtree->isPointInside(center))
-            {
-                double theta_t = 1.0 / (0.87 + 1.0 * 0.18);
-                double v = 1.0*random()/RAND_MAX;
-                t = log(1-v) / (-theta_t) * gridSpan.x / 2;
-                return true;
+            if(res) {
+                t = its.t;
             }
-            else {
-                float tout = 1.0/0.0, tmin = 0.;
-                bool res = m_mesh_kdtree->hit(ray, tout, tmin);
-                if(res) {
-                    t = (Float)tout;
-                    return true;
-                }
-                return false;
-            }
+            return res;
         }
         // DA
-        else if(DA == m_mode) {
+        else if(DA == m_renderMode) {
             ;
         }
         // debug
         else {
-            hitInfo hitinfo;
-            bool res = ((Grain*)m_grains.at(0))->rayIntersect( // TODO, grain index
+            Intersection its;
+            bool res = ((Grain*)m_grains.at(0))->rayIntersect(
                         Transform(),
                         // transform into the unit sphere
                         Ray(Point(ray.o.x, ray.o.y - gridSpan.y, ray.o.z) / (500.0), ray.d, ray.time),
-                        &hitinfo
+                        its
                         );
 
             if(res) {
-                t = 1.0;
+                t = its.t;
 
                 if(temp) {
                     new(temp) GrainIntersectionInfo;
-                    GrainIntersectionInfo* tempinfo = (GrainIntersectionInfo*)temp;
-                    tempinfo->valid = true;
-                    tempinfo->rendermode = DEBUG;
-                    tempinfo->object = hitinfo.hitObject;
+                    GrainIntersectionInfo* grainIntersectionInfo = (GrainIntersectionInfo*)temp;
+                    grainIntersectionInfo->rendermode = DEBUG;
+                    grainIntersectionInfo->uv = its.uv;
+                    grainIntersectionInfo->n = its.shFrame.n;
+                    grainIntersectionInfo->dpdu = its.dpdu;
+                    grainIntersectionInfo->dpdv = its.dpdv;
                 }
 
                 return true;
@@ -1044,14 +1370,14 @@ public:
         Ray ray;
         m_worldToObject(_ray, ray);
 
-        if(EPT == m_mode) {
+        if(EPT == m_renderMode) {
             Float t;
             return rayIntersect(_ray, mint, maxt, t, NULL);
         }
-        else if(VPT == m_mode) {
-            ;
+        else if(VPT == m_renderMode) {
+            return m_shapeKDTree->rayIntersect(ray);
         }
-        else if(DA == m_mode) {
+        else if(DA == m_renderMode) {
             ;
         }
         else {
@@ -1059,7 +1385,7 @@ public:
         }
 
         /*
-        float tout;
+        float tout = 1.0/0.0;
         return m_mesh_kdtree->hit(ray, tout, mint);
         */
 
@@ -1069,74 +1395,54 @@ public:
     void fillIntersectionRecord(const Ray &ray,
             const void *temp, Intersection &its) const {
         its.p = ray(its.t);
-        Point local = m_worldToObject(its.p);
+        //Point local = m_worldToObject(its.p);
 
         const GrainIntersectionInfo* tempinfo = static_cast<const GrainIntersectionInfo*>(temp);
 
-        if(tempinfo->valid) {
-            grain::KDTriangle* kdtriangle = static_cast<grain::KDTriangle*>(tempinfo->object);
 
-            Transform tr = tempinfo->tr.inverse();
+        if(EPT==tempinfo->rendermode || VPT==tempinfo->rendermode) {
+            //grain::KDTriangle* kdtriangle = static_cast<grain::KDTriangle*>(tempinfo->object);
 
-            its.uv = kdtriangle->getUV();
-            its.shape = this;
-            TangentSpace tangentSpace = kdtriangle->getUVTangent(); // TODO transform
-            its.dpdu = m_objectToWorld(tr(tangentSpace.dpdu));
-            its.dpdv = m_objectToWorld(tr(tangentSpace.dpdv));
+            its.uv = tempinfo->uv;
+            its.shape = tempinfo->shape;
+            its.shFrame.n = m_objectToWorld(tempinfo->n);
+            its.geoFrame.n = its.shFrame.n;
+
+            if (m_flipNormals)
+                its.geoFrame.n *= -1;
+
+            its.hasUVPartials = false;
+            its.instance = NULL;
+            its.time = ray.time;
+
+            its.dpdu = m_objectToWorld((tempinfo->dpdu));
+            its.dpdv = m_objectToWorld((tempinfo->dpdv));
             its.geoFrame.s = normalize(its.dpdu);
             its.geoFrame.t = normalize(its.dpdv);
-            its.geoFrame.n = Normal(cross(its.geoFrame.s, its.geoFrame.t));
+
+            if(0 & OUTPUT_CONDITION){
+                std::cout<<"dpdu: "<<its.dpdu.toString()<<"  dpdv: "<<its.dpdv.toString()<<"  computerN: "
+                           <<normalize(cross(its.dpdu, its.dpdv)).toString()<<"   shframeN: "
+                             <<its.shFrame.n.toString()<<std::endl;
+
+            }
+
+
+            //its.geoFrame.n = Normal(cross(its.geoFrame.s, its.geoFrame.t));
 
             /* Mitigate roundoff error issues by a normal shift of the computed intersection point */
             //its.p += its.geoFrame.n * (m_radius - std::sqrt(local.x*local.x+local.y*local.y));
 
-            if (m_flipNormals)
-                its.geoFrame.n *= -1;
-            its.shFrame.n = its.geoFrame.n;
-            its.hasUVPartials = false;
-            its.instance = NULL;
-            its.time = ray.time;
 
+            /*
+            Vector dndu, dndv;
+            its.shape->getNormalDerivative(its, dndu, dndv, false);
+            its.shape->getNormalDerivative(its, dndu, dndv, true);
+            */
 
-            // TODO eliminate temp
-            its.temp = (void*)temp;
-        }
-        else {
-            Float phi = std::atan2(local.y, local.x);
-            if (phi < 0)
-                phi += 2*M_PI;
-            its.uv.x = phi / (2*M_PI);
-            its.uv.y = local.z / m_length;
-
-            Vector dpdu = Vector(-local.y, local.x, 0) * (2*M_PI);
-            Vector dpdv = Vector(0, 0, m_length);
-            its.shape = this;
-            its.dpdu = m_objectToWorld(dpdu);
-            its.dpdv = m_objectToWorld(dpdv);
-            its.geoFrame.s = normalize(its.dpdu);
-            its.geoFrame.t = normalize(its.dpdv);
-            its.geoFrame.n = Normal(cross(its.geoFrame.s, its.geoFrame.t));
-
-            /* Migitate roundoff error issues by a normal shift of the computed intersection point */
-            its.p += its.geoFrame.n * (m_radius - std::sqrt(local.x*local.x+local.y*local.y));
-
-            if (m_flipNormals)
-                its.geoFrame.n *= -1;
-            its.shFrame.n = its.geoFrame.n;
-            its.hasUVPartials = false;
-            its.instance = NULL;
-            its.time = ray.time;
         }
 
-
-        /*
-        Float vvv[SPECTRUM_SAMPLES];
-        vvv[0] = 0.5;
-        vvv[1] = 0.2;
-        vvv[2] = 0.3;
-        Spectrum value(vvv);
-        its.color = value;
-        */
+        its.temp = (void*)temp;
     }
 
     struct OBJTriangle {
@@ -1676,6 +1982,7 @@ public:
         if (cClass->derivesFrom(MTS_CLASS(BSDF))) {
             Shape::addChild(name, child);
             Assert(m_meshes.size() > 0);
+
             if (name == "") {
                 for (size_t i=0; i<m_meshes.size(); ++i)
                     m_meshes[i]->addChild(name, child);
@@ -1687,6 +1994,15 @@ public:
                         m_meshes[i]->addChild(name, child);
                     }
                 }
+
+                /* add bsdf to an individual grain */
+                for (size_t i=0; i<m_grains.size(); i++) {
+                    if (m_grains.at(i)->getName() == name) {
+                        found = true;
+                        m_grains.at(i)->addChild(child);
+                    }
+                }
+
                 if (!found && warn)
                     Log(EWarn, "Attempted to register the material named "
                         "'%s', which does not occur in the OBJ file!", name.c_str());
@@ -1694,9 +2010,8 @@ public:
             m_bsdf->setParent(NULL);
         } else if (cClass->derivesFrom(MTS_CLASS(Emitter))) {
             if (m_meshes.size() > 1)
-                ; //TODO any side-effects?
-                //Log(EError, "Cannot attach an emitter to an OBJ file "
-                    //"containing multiple objects!");
+                Log(EError, "Cannot attach an emitter to an OBJ file "
+                    "containing multiple objects!");
             m_emitter = static_cast<Emitter *>(child);
             child->setParent(m_meshes[0]);
             m_meshes[0]->addChild(name, child);
@@ -1723,12 +2038,6 @@ public:
             Shape::addChild(name, child);
         }
     }
-
-#if 0
-    bool isCompound() const {
-        return true;
-    }
-#endif
 
     Shape *getElement(int index) {
         if (index >= (int) m_meshes.size())
@@ -1759,7 +2068,7 @@ public:
     }
 
     size_t getPrimitiveCount() const {
-        return 1; //ying
+        //return 1; //ying
 
         size_t result = 0;
         for (size_t i=0; i<m_meshes.size(); ++i)
@@ -1768,7 +2077,7 @@ public:
     }
 
     size_t getEffectivePrimitiveCount() const {
-        return 1; //ying
+        //return 1; //ying
 
         size_t result = 0;
         for (size_t i=0; i<m_meshes.size(); ++i)
@@ -1776,6 +2085,46 @@ public:
         return result;
     }
 
+
+
+    void extractKDTrianglesFromMeshes(
+            std::vector<TriMesh*> &meshes,
+            std::vector<grain::KDTriangle*> &KDTriangles)
+    {
+        for(size_t i=0; i<meshes.size(); i++)
+        {
+            int count = meshes.at(i)->getTriangleCount();
+            const Triangle* triangles = meshes.at(i)->getTriangles();
+            Point* positions = meshes.at(i)->getVertexPositions();
+            Normal* normals;
+            if(meshes.at(i)->hasVertexNormals())
+                normals = meshes.at(i)->getVertexNormals();
+            Point2* uvs;
+            if(meshes.at(i)->hasVertexTexcoords())
+                uvs = meshes.at(i)->getVertexTexcoords();
+
+            for(size_t j=0; j<count; j++) {
+                grain::KDTriangle *t = new grain::KDTriangle(
+                            positions[triangles[j].idx[0]],
+                            positions[triangles[j].idx[1]],
+                            positions[triangles[j].idx[2]]);
+
+                if(meshes.at(i)->hasVertexNormals()) {
+                    t->addNormal(normals[triangles[j].idx[0]],
+                                 normals[triangles[j].idx[1]],
+                                 normals[triangles[j].idx[2]]);
+                }
+
+                if(meshes.at(i)->hasVertexTexcoords()) {
+                    t->addUV(uvs[triangles[j].idx[0]],
+                             uvs[triangles[j].idx[1]],
+                             uvs[triangles[j].idx[2]]);
+                }
+
+                KDTriangles.push_back(t);
+            }
+        }
+    }
 
     MTS_DECLARE_CLASS()
 private:
@@ -1788,498 +2137,6 @@ private:
 #endif
 
 
-# if TEST
-class GrainMesh : public Shape {
-private:
-    Transform m_objectToWorld;
-    Transform m_worldToObject;
-    Float m_radius, m_length, m_invSurfaceArea;
-    bool m_flipNormals;
-
-public:
-    GrainMesh(const Properties &props) : Shape(props) {
-# if 0
-        // int dimension = props.getInteger("dimension", 128);
-
-        ref<FileResolver> fileResolver = Thread::getThread()->getFileResolver()->clone();
-        fs::path path = fileResolver->resolve(props.getString("filename"));
-
-        m_name = path.stem().string();
-
-        /* Object-space -> World-space transformation */
-        //Transform objectToWorld = props.getTransform("toWorld", Transform());
-
-        /* Load the geometry */
-        Log(EInfo, "Loading binvox from \"%s\" ..", path.filename().string().c_str());
-
-        fileResolver->prependPath(fs::absolute(path).parent_path());
-
-        ref<Timer> timer = new Timer();
-
-        read_binvox(path.string()+".binvox");
-        read_binvox(path.string()+".hollow.binvox", false);
-
-        Log(EInfo, "Done with \"%s\" (took %i ms)", path.filename().string().c_str(), timer->getMilliseconds());
-
-        m_obj = new WavefrontOBJ(props);
-        AABB aabb = m_obj->getAABB();
-        Log(EInfo, "Mesh aabb: %f %f %f, %f %f %f",
-            aabb.min.x, aabb.min.y, aabb.min.z, aabb.max.x, aabb.max.y, aabb.max.z);
-#endif
-
-        Float radius = props.getFloat("radius", 1.0f);
-        Point p1 = props.getPoint("p0", Point(0.0f, 0.0f, 0.0f));
-        Point p2 = props.getPoint("p1", Point(0.0f, 0.0f, 1.0f));
-        Vector d = p2 - p1;
-        Float length = d.length();
-        m_objectToWorld =
-            Transform::translate(Vector(p1)) *
-            Transform::fromFrame(Frame(d / length)) *
-            Transform::scale(Vector(radius, radius, length));
-
-        if (props.hasProperty("toWorld"))
-            m_objectToWorld = props.getTransform("toWorld") * m_objectToWorld;
-
-        /// Are the cylinder normals pointing inwards? default: no
-        m_flipNormals = props.getBoolean("flipNormals", false);
-
-        // Remove the scale from the object-to-world transform
-        m_radius = m_objectToWorld(Vector(1,0,0)).length();
-        m_length = m_objectToWorld(Vector(0,0,1)).length();
-        m_objectToWorld = m_objectToWorld * Transform::scale(
-            Vector(1/m_radius, 1/m_radius, 1/m_length));
-
-        m_worldToObject = m_objectToWorld.inverse();
-        m_invSurfaceArea = 1/(2*M_PI*m_radius*m_length);
-        Assert(m_length > 0 && m_radius > 0);
-    }
-
-    GrainMesh(Stream *stream, InstanceManager *manager)
-        : Shape(stream, manager) {
-        m_objectToWorld = Transform(stream);
-        m_radius = stream->readFloat();
-        m_length = stream->readFloat();
-        m_flipNormals = stream->readBool();
-        m_worldToObject = m_objectToWorld.inverse();
-        m_invSurfaceArea = 1/(2*M_PI*m_radius*m_length);
-    }
-
-    void serialize(Stream *stream, InstanceManager *manager) const {
-        Shape::serialize(stream, manager);
-        m_objectToWorld.serialize(stream);
-        stream->writeFloat(m_radius);
-        stream->writeFloat(m_length);
-        stream->writeBool(m_flipNormals);
-    }
-
-    bool rayIntersect(const Ray &_ray, Float mint, Float maxt, Float &t, void *temp) const {
-        Ray ray;
-        /* Transform into the local coordinate system and normalize */
-        m_worldToObject(_ray, ray);
-
-        const double
-            ox = ray.o.x,
-            oy = ray.o.y,
-            dx = ray.d.x,
-            dy = ray.d.y;
-
-        const double A = dx*dx + dy*dy;
-        const double B = 2 * (dx*ox + dy*oy);
-        const double C = ox*ox + oy*oy - m_radius*m_radius;
-
-        double nearT, farT;
-        if (!solveQuadraticDouble(A, B, C, nearT, farT))
-            return false;
-
-        if (!(nearT <= maxt && farT >= mint)) /* NaN-aware conditionals */
-            return false;
-
-        const double zPosNear = ray.o.z + ray.d.z * nearT;
-        const double zPosFar = ray.o.z + ray.d.z * farT;
-
-        if (zPosNear >= 0 && zPosNear <= m_length && nearT >= mint) {
-            t = (Float) nearT;
-        } else if (zPosFar >= 0 && zPosFar <= m_length) {
-            if (farT > maxt)
-                return false;
-            t = (Float) farT;
-        } else {
-            return false;
-        }
-
-        return true;
-    }
-
-    bool rayIntersect(const Ray &_ray, Float mint, Float maxt) const {
-        Ray ray;
-        /* Transform into the local coordinate system and normalize */
-        m_worldToObject(_ray, ray);
-
-        const double
-            ox = ray.o.x,
-            oy = ray.o.y,
-            dx = ray.d.x,
-            dy = ray.d.y;
-
-        const double A = dx*dx + dy*dy;
-        const double B = 2 * (dx*ox + dy*oy);
-        const double C = ox*ox + oy*oy - m_radius*m_radius;
-
-        double nearT, farT;
-        if (!solveQuadraticDouble(A, B, C, nearT, farT))
-            return false;
-
-        if (nearT > maxt || farT < mint)
-            return false;
-
-        const double zPosNear = ray.o.z + ray.d.z * nearT;
-        const double zPosFar = ray.o.z + ray.d.z * farT;
-        if (zPosNear >= 0 && zPosNear <= m_length && nearT >= mint) {
-            return true;
-        } else if (zPosFar >= 0 && zPosFar <= m_length && farT <= maxt) {
-            return true;
-        } else {
-            return false;
-        }
-    }
-
-    void fillIntersectionRecord(const Ray &ray,
-            const void *temp, Intersection &its) const {
-        its.p = ray(its.t);
-        Point local = m_worldToObject(its.p);
-
-        Float phi = std::atan2(local.y, local.x);
-        if (phi < 0)
-            phi += 2*M_PI;
-        its.uv.x = phi / (2*M_PI);
-        its.uv.y = local.z / m_length;
-
-        Vector dpdu = Vector(-local.y, local.x, 0) * (2*M_PI);
-        Vector dpdv = Vector(0, 0, m_length);
-        its.shape = this;
-        its.dpdu = m_objectToWorld(dpdu);
-        its.dpdv = m_objectToWorld(dpdv);
-        its.geoFrame.s = normalize(its.dpdu);
-        its.geoFrame.t = normalize(its.dpdv);
-        its.geoFrame.n = Normal(cross(its.geoFrame.s, its.geoFrame.t));
-
-        /* Migitate roundoff error issues by a normal shift of the computed intersection point */
-        its.p += its.geoFrame.n * (m_radius - std::sqrt(local.x*local.x+local.y*local.y));
-
-        if (m_flipNormals)
-            its.geoFrame.n *= -1;
-        its.shFrame.n = its.geoFrame.n;
-        its.hasUVPartials = false;
-        its.instance = NULL;
-        its.time = ray.time;
-    }
-
-    void samplePosition(PositionSamplingRecord &pRec, const Point2 &sample) const {
-        Float sinTheta, cosTheta;
-        math::sincos(sample.y * (2 * M_PI), &sinTheta, &cosTheta);
-
-        Point p(cosTheta*m_radius, sinTheta*m_radius, sample.x * m_length);
-        Normal n(cosTheta, sinTheta, 0.0f);
-
-        if (m_flipNormals)
-            n *= -1;
-
-        pRec.p = m_objectToWorld(p);
-        pRec.n = normalize(m_objectToWorld(n));
-        pRec.pdf = m_invSurfaceArea;
-        pRec.measure = EArea;
-    }
-
-    Float pdfPosition(const PositionSamplingRecord &pRec) const {
-        return m_invSurfaceArea;
-    }
-
-    inline AABB getAABB() const {
-        Vector x1 = m_objectToWorld(Vector(m_radius, 0, 0));
-        Vector x2 = m_objectToWorld(Vector(0, m_radius, 0));
-        Point p0 = m_objectToWorld(Point(0, 0, 0));
-        Point p1 = m_objectToWorld(Point(0, 0, m_length));
-        AABB result;
-
-        /* To bound the cylinder, it is sufficient to find the
-           smallest box containing the two circles at the endpoints.
-           This can be done component-wise as follows */
-
-        for (int i=0; i<3; ++i) {
-            Float range = std::sqrt(x1[i]*x1[i] + x2[i]*x2[i]);
-
-            result.min[i] = std::min(std::min(result.min[i],
-                        p0[i]-range), p1[i]-range);
-            result.max[i] = std::max(std::max(result.max[i],
-                        p0[i]+range), p1[i]+range);
-        }
-
-        return result;
-    }
-
-    /**
-     * Compute the ellipse created by the intersection of an infinite
-     * cylinder and a plane. Returns false in the degenerate case.
-     * Based on:
-     * www.geometrictools.com/Documentation/IntersectionCylinderPlane.pdf
-     */
-    bool intersectCylPlane(Point planePt, Normal planeNrml,
-            Point cylPt, Vector cylD, Float radius, Point &center,
-            Vector *axes, Float *lengths) const {
-        if (absDot(planeNrml, cylD) < Epsilon)
-            return false;
-
-        Vector B, A = cylD - dot(cylD, planeNrml)*planeNrml;
-
-        Float length = A.length();
-        if (length != 0) {
-            A /= length;
-            B = cross(planeNrml, A);
-        } else {
-            coordinateSystem(planeNrml, A, B);
-        }
-
-        Vector delta = planePt - cylPt,
-               deltaProj = delta - cylD*dot(delta, cylD);
-
-        Float aDotD = dot(A, cylD);
-        Float bDotD = dot(B, cylD);
-        Float c0 = 1-aDotD*aDotD;
-        Float c1 = 1-bDotD*bDotD;
-        Float c2 = 2*dot(A, deltaProj);
-        Float c3 = 2*dot(B, deltaProj);
-        Float c4 = dot(delta, deltaProj) - radius*radius;
-
-        Float lambda = (c2*c2/(4*c0) + c3*c3/(4*c1) - c4)/(c0*c1);
-
-        Float alpha0 = -c2/(2*c0),
-              beta0 = -c3/(2*c1);
-
-        lengths[0] = std::sqrt(c1*lambda),
-        lengths[1] = std::sqrt(c0*lambda);
-
-        center = planePt + alpha0 * A + beta0 * B;
-        axes[0] = A;
-        axes[1] = B;
-        return true;
-    }
-
-    AABB intersectCylFace(int axis,
-            const Point &min, const Point &max,
-            const Point &cylPt, const Vector &cylD) const {
-        int axis1 = (axis + 1) % 3;
-        int axis2 = (axis + 2) % 3;
-
-        Normal planeNrml(0.0f);
-        planeNrml[axis] = 1;
-
-        Point ellipseCenter;
-        Vector ellipseAxes[2];
-        Float ellipseLengths[2];
-
-        AABB aabb;
-        if (!intersectCylPlane(min, planeNrml, cylPt, cylD, m_radius,
-            ellipseCenter, ellipseAxes, ellipseLengths)) {
-            /* Degenerate case -- return an invalid AABB. This is
-               not a problem, since one of the other faces will provide
-               enough information to arrive at a correct clipped AABB */
-            return aabb;
-        }
-
-        /* Intersect the ellipse against the sides of the AABB face */
-        for (int i=0; i<4; ++i) {
-            Point p1, p2;
-            p1[axis] = p2[axis] = min[axis];
-            p1[axis1] = ((i+1) & 2) ? min[axis1] : max[axis1];
-            p1[axis2] = ((i+0) & 2) ? min[axis2] : max[axis2];
-            p2[axis1] = ((i+2) & 2) ? min[axis1] : max[axis1];
-            p2[axis2] = ((i+1) & 2) ? min[axis2] : max[axis2];
-
-            Point2 p1l(
-                dot(p1 - ellipseCenter, ellipseAxes[0]) / ellipseLengths[0],
-                dot(p1 - ellipseCenter, ellipseAxes[1]) / ellipseLengths[1]);
-            Point2 p2l(
-                dot(p2 - ellipseCenter, ellipseAxes[0]) / ellipseLengths[0],
-                dot(p2 - ellipseCenter, ellipseAxes[1]) / ellipseLengths[1]);
-
-            Vector2 rel = p2l-p1l;
-            Float A = dot(rel, rel);
-            Float B = 2*dot(Vector2(p1l), rel);
-            Float C = dot(Vector2(p1l), Vector2(p1l))-1;
-
-            Float x0, x1;
-            if (solveQuadratic(A, B, C, x0, x1)) {
-                if (x0 >= 0 && x0 <= 1)
-                    aabb.expandBy(p1+(p2-p1)*x0);
-                if (x1 >= 0 && x1 <= 1)
-                    aabb.expandBy(p1+(p2-p1)*x1);
-            }
-        }
-
-        ellipseAxes[0] *= ellipseLengths[0];
-        ellipseAxes[1] *= ellipseLengths[1];
-        AABB faceBounds(min, max);
-
-        /* Find the componentwise maxima of the ellipse */
-        for (int i=0; i<2; ++i) {
-            int j = (i==0) ? axis1 : axis2;
-            Float alpha = ellipseAxes[0][j], beta = ellipseAxes[1][j];
-            Float tmp = 1 / std::sqrt(alpha*alpha + beta*beta);
-            Float cosTheta = alpha * tmp, sinTheta = beta*tmp;
-
-            Point p1 = ellipseCenter + cosTheta*ellipseAxes[0] + sinTheta*ellipseAxes[1];
-            Point p2 = ellipseCenter - cosTheta*ellipseAxes[0] - sinTheta*ellipseAxes[1];
-
-            if (faceBounds.contains(p1))
-                aabb.expandBy(p1);
-            if (faceBounds.contains(p2))
-                aabb.expandBy(p2);
-        }
-
-        return aabb;
-    }
-
-
-
-    AABB getClippedAABB(const AABB &box) const {
-        /* Compute a base bounding box */
-        AABB base(getAABB());
-        base.clip(box);
-
-        Point cylPt = m_objectToWorld(Point(0, 0, 0));
-        Vector cylD(m_objectToWorld(Vector(0, 0, 1)));
-
-        /* Now forget about the cylinder ends and
-           intersect an infinite cylinder with each AABB face */
-        AABB clippedAABB;
-        clippedAABB.expandBy(intersectCylFace(0,
-                Point(base.min.x, base.min.y, base.min.z),
-                Point(base.min.x, base.max.y, base.max.z),
-                cylPt, cylD));
-
-        clippedAABB.expandBy(intersectCylFace(0,
-                Point(base.max.x, base.min.y, base.min.z),
-                Point(base.max.x, base.max.y, base.max.z),
-                cylPt, cylD));
-
-        clippedAABB.expandBy(intersectCylFace(1,
-                Point(base.min.x, base.min.y, base.min.z),
-                Point(base.max.x, base.min.y, base.max.z),
-                cylPt, cylD));
-
-        clippedAABB.expandBy(intersectCylFace(1,
-                Point(base.min.x, base.max.y, base.min.z),
-                Point(base.max.x, base.max.y, base.max.z),
-                cylPt, cylD));
-
-        clippedAABB.expandBy(intersectCylFace(2,
-                Point(base.min.x, base.min.y, base.min.z),
-                Point(base.max.x, base.max.y, base.min.z),
-                cylPt, cylD));
-
-        clippedAABB.expandBy(intersectCylFace(2,
-                Point(base.min.x, base.min.y, base.max.z),
-                Point(base.max.x, base.max.y, base.max.z),
-                cylPt, cylD));
-
-        clippedAABB.clip(box);
-        return clippedAABB;
-    }
-
-    ref<TriMesh> createTriMesh() {
-        /// Choice of discretization
-        const size_t phiSteps = 20;
-        const Float dPhi   = (2*M_PI) / phiSteps;
-
-        ref<TriMesh> mesh = new TriMesh("Cylinder approximation",
-            phiSteps*2, phiSteps*2, true, false, false);
-
-        Point *vertices = mesh->getVertexPositions();
-        Normal *normals = mesh->getVertexNormals();
-        Triangle *triangles = mesh->getTriangles();
-        size_t triangleIdx = 0, vertexIdx = 0;
-
-        for (size_t phi=0; phi<phiSteps; ++phi) {
-            Float sinPhi = std::sin(phi * dPhi);
-            Float cosPhi = std::cos(phi * dPhi);
-            uint32_t idx0 = (uint32_t) vertexIdx, idx1 = idx0+1;
-            uint32_t idx2 = (vertexIdx+2) % (2*phiSteps), idx3 = idx2+1;
-            normals[vertexIdx] = m_objectToWorld(Normal(cosPhi, sinPhi, 0) * (m_flipNormals ? (Float) -1 : (Float) 1));
-            vertices[vertexIdx++] = m_objectToWorld(Point(cosPhi*m_radius, sinPhi*m_radius, 0));
-            normals[vertexIdx] = m_objectToWorld(Normal(cosPhi, sinPhi, 0) * (m_flipNormals ? (Float) -1 : (Float) 1));
-            vertices[vertexIdx++] = m_objectToWorld(Point(cosPhi*m_radius, sinPhi*m_radius, m_length));
-
-            triangles[triangleIdx].idx[0] = idx0;
-            triangles[triangleIdx].idx[1] = idx2;
-            triangles[triangleIdx].idx[2] = idx1;
-            triangleIdx++;
-            triangles[triangleIdx].idx[0] = idx1;
-            triangles[triangleIdx].idx[1] = idx2;
-            triangles[triangleIdx].idx[2] = idx3;
-            triangleIdx++;
-        }
-
-        mesh->copyAttachments(this);
-        mesh->configure();
-
-        return mesh.get();
-    }
-
-#if 0
-    AABB getAABB() const {
-        const Point a = m_objectToWorld(Point(0, 0, 0));
-        const Point b = m_objectToWorld(Point(0, 0, m_length));
-
-        const Float r = m_radius;
-        AABB result;
-        result.expandBy(a - Vector(r, r, r));
-        result.expandBy(a + Vector(r, r, r));
-        result.expandBy(b - Vector(r, r, r));
-        result.expandBy(b + Vector(r, r, r));
-        return result;
-    }
-#endif
-
-    Float getSurfaceArea() const {
-        return 2*M_PI*m_radius*m_length;
-    }
-
-    void getNormalDerivative(const Intersection &its,
-            Vector &dndu, Vector &dndv, bool shadingFrame) const {
-        dndu = its.dpdu / (m_radius * (m_flipNormals ? -1 : 1));
-        dndv = Vector(0.0f);
-    }
-
-    size_t getPrimitiveCount() const {
-        return 1;
-    }
-
-    size_t getEffectivePrimitiveCount() const {
-        return 1;
-    }
-
-    std::string toString() const {
-        std::ostringstream oss;
-        oss << "GrainMesh[" << endl
-            << "  radius = " << m_radius << "," << endl
-            << "  length = " << m_length << "," << endl
-            << "  objectToWorld = " << indent(m_objectToWorld.toString()) << "," << endl
-            << "  bsdf = " << indent(m_bsdf.toString()) << "," << endl;
-        if (isMediumTransition())
-            oss << "  interiorMedium = " << indent(m_interiorMedium.toString()) << "," << endl
-                << "  exteriorMedium = " << indent(m_exteriorMedium.toString()) << "," << endl;
-        oss << "  emitter = " << indent(m_emitter.toString()) << "," << endl
-            << "  sensor = " << indent(m_sensor.toString()) << "," << endl
-            << "  subsurface = " << indent(m_subsurface.toString())
-            << "]";
-        return oss.str();
-    }
-
-    MTS_DECLARE_CLASS()
-};
-#endif
-
 MTS_IMPLEMENT_CLASS_S(GrainMesh, false, Shape)
 MTS_EXPORT_PLUGIN(GrainMesh, "GrainMesh intersection primitive");
 MTS_NAMESPACE_END
-

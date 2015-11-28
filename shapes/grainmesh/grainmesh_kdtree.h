@@ -36,6 +36,8 @@ struct KDTriangle {
         m_points[2] = p3;
     }
 
+    inline Point* getVertexPositions() { return m_points; }
+
     inline void addNormal(Normal n1, Normal n2, Normal n3) {
         m_hasUV = true;
         m_normals[0] = n1;
@@ -65,7 +67,7 @@ struct KDTriangle {
         return (m_normals[0] + m_normals[1] + m_normals[2]) / 3.0;
     }
 
-    inline Point2 getUV() const {
+    inline Point2 getUV(Float u, Float v) const {
         return (m_uvs[0] + m_uvs[1] + m_uvs[2]) / 3.0;
     }
 
@@ -81,15 +83,81 @@ struct KDTriangle {
         return Vector(p.x, p.y, p.z);
     }
 
-    bool hit(const Ray& ray, float& to, float& tmin) {
+    bool hit(const Ray& ray, float& t_, float& tmin, float& u_, float& v_) {
         // return 1==hit_(ray, to, tmin);
         Float u,v,t;
         bool res = rayIntersect(m_points[0], m_points[1], m_points[2],
                 ray, u, v, t) ;
         if(res && t>=tmin) {
-            to = (float)t;
+            t_ = (float)t;
+            u_ = (float)u;
+            v_ = (float)v;
             return true;
         }
+        return false;
+    }
+
+
+    /** \brief Ray-triangle intersection test
+     *
+     * Uses the algorithm by Moeller and Trumbore discussed at
+     * <tt>http://www.acm.org/jgt/papers/MollerTrumbore97/code.html</tt>.
+     *
+     * \param p0
+     *    Position of the first vertex
+     * \param p1
+     *    Position of the second vertex
+     * \param p2
+     *    Position of the third vertex
+     * \param ray
+     *    The ray segment to be used for the intersection query
+     * \param t
+     *    Upon success, \a t contains the distance from the ray origin to the
+     *    intersection point,
+     * \param u
+     *   Upon success, \c u will contain the 'U' component of the intersection
+     *   in barycentric coordinates
+     * \param v
+     *   Upon success, \c v will contain the 'V' component of the intersection
+     *   in barycentric coordinates
+     * \return
+     *   \c true if an intersection has been detected
+     */
+    FINLINE static bool rayIntersect(const Point &p0, const Point &p1, const Point &p2,
+        const Ray &ray, Float &u, Float &v, Float &t) {
+        /* Find vectors for two edges sharing */
+        Vector edge1 = p1 - p0, edge2 = p2 - p0;
+
+        /* Begin calculating determinant - also used to calculate U parameter */
+        Vector pvec = cross(ray.d, edge2);
+
+        Float det = dot(edge1, pvec);
+        if (det == 0)
+            return false;
+        Float inv_det = 1.0f / det;
+
+        /* Calculate distance from v[0] to ray origin */
+        Vector tvec = ray.o - p0;
+
+        /* Calculate U parameter and test bounds */
+        u = dot(tvec, pvec) * inv_det;
+        if (u < 0.0 || u > 1.0)
+            return false;
+
+        /* Prepare to test V parameter */
+        Vector qvec = cross(tvec, edge1);
+
+        /* Calculate V parameter and test bounds */
+        v = dot(ray.d, qvec) * inv_det;
+
+        /* Inverted comparison (to catch NaNs) */
+        if (v >= 0.0 && u + v <= 1.0) {
+            /* ray intersects triangle -> compute t */
+            t = dot(edge2, qvec) * inv_det;
+
+            return true;
+        }
+
         return false;
     }
 
@@ -160,7 +228,6 @@ struct KDTriangle {
         return 1;                       // I is in T
     }
 #endif
-
 #if 0
     /**
      * \brief Returns the axis-aligned bounding box of a triangle after it has
@@ -200,69 +267,6 @@ struct KDTriangle {
     Float surfaceArea(const Point *positions) const;
 
 #endif
-    /** \brief Ray-triangle intersection test
-     *
-     * Uses the algorithm by Moeller and Trumbore discussed at
-     * <tt>http://www.acm.org/jgt/papers/MollerTrumbore97/code.html</tt>.
-     *
-     * \param p0
-     *    Position of the first vertex
-     * \param p1
-     *    Position of the second vertex
-     * \param p2
-     *    Position of the third vertex
-     * \param ray
-     *    The ray segment to be used for the intersection query
-     * \param t
-     *    Upon success, \a t contains the distance from the ray origin to the
-     *    intersection point,
-     * \param u
-     *   Upon success, \c u will contain the 'U' component of the intersection
-     *   in barycentric coordinates
-     * \param v
-     *   Upon success, \c v will contain the 'V' component of the intersection
-     *   in barycentric coordinates
-     * \return
-     *   \c true if an intersection has been detected
-     */
-    FINLINE static bool rayIntersect(const Point &p0, const Point &p1, const Point &p2,
-        const Ray &ray, Float &u, Float &v, Float &t) {
-        /* Find vectors for two edges sharing */
-        Vector edge1 = p1 - p0, edge2 = p2 - p0;
-
-        /* Begin calculating determinant - also used to calculate U parameter */
-        Vector pvec = cross(ray.d, edge2);
-
-        Float det = dot(edge1, pvec);
-        if (det == 0)
-            return false;
-        Float inv_det = 1.0f / det;
-
-        /* Calculate distance from v[0] to ray origin */
-        Vector tvec = ray.o - p0;
-
-        /* Calculate U parameter and test bounds */
-        u = dot(tvec, pvec) * inv_det;
-        if (u < 0.0 || u > 1.0)
-            return false;
-
-        /* Prepare to test V parameter */
-        Vector qvec = cross(tvec, edge1);
-
-        /* Calculate V parameter and test bounds */
-        v = dot(ray.d, qvec) * inv_det;
-
-        /* Inverted comparison (to catch NaNs) */
-        if (v >= 0.0 && u + v <= 1.0) {
-            /* ray intersects triangle -> compute t */
-            t = dot(edge2, qvec) * inv_det;
-
-            return true;
-        }
-
-        return false;
-    }
-
 #if 0
     /** \brief Ray-triangle intersection test
      *

@@ -109,11 +109,11 @@ public:
 		 * exactly match the output of other integrators under all settings
 		 * of this parameter.
 		 */
-		while (rRec.depth <= m_maxDepth || m_maxDepth < 0) {
+        while (rRec.depth <= m_maxDepth || m_maxDepth < 0) {
 			/* ==================================================================== */
 			/*                 Radiative Transfer Equation sampling                 */
 			/* ==================================================================== */
-			if (rRec.medium && rRec.medium->sampleDistance(Ray(ray, 0, its.t), mRec, rRec.sampler)) {
+            if (rRec.medium && rRec.medium->sampleDistance(Ray(ray, 0, its.t), mRec, rRec.sampler)) {
 				/* Sample the integral
 				   \int_x^y tau(x, x') [ \sigma_s \int_{S^2} \rho(\omega,\omega') L(x,\omega') d\omega' ] dx'
 				*/
@@ -160,7 +160,7 @@ public:
 				scene->rayIntersect(ray, its);
 				nullChain = false;
 				scattered = true;
-			} else {
+            } else {
 				/* Sample
 					tau(x, y) * (Surface integral). This happens with probability mRec.pdfFailure
 					Account for this and multiply by the proper per-color-channel transmittance.

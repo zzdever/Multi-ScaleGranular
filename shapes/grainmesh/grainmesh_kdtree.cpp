@@ -141,14 +141,16 @@ bool KDNode::hit(const Ray& ray, float& t, float& tmin, hitInfo* info/*, ShadeRe
         }
         // leaf node
         else {
-            float nearestT = 1.0/0.0;
-            float to;
+            float nearestT = 1.0/0.0, u, v;
+            float t_tmp, u_tmp, v_tmp;
             KDTriangle *hitTriangle;
             for (size_t i=0; i < this->triangles.size(); i++) {
-                if (this->triangles[i]->hit(ray, to, tmin/*, sr*/)) {
-                    if (to<nearestT) {
+                if (this->triangles[i]->hit(ray, t_tmp, tmin, u_tmp, v_tmp/*, sr*/)) {
+                    if (t_tmp<nearestT) {
                         hit_tri = true;
-                        nearestT = to;
+                        nearestT = t_tmp;
+                        u = u_tmp;
+                        v = v_tmp;
                         hitTriangle = this->triangles[i];
                     }
                     //ying sr.hit_obj = true;
@@ -174,6 +176,8 @@ bool KDNode::hit(const Ray& ray, float& t, float& tmin, hitInfo* info/*, ShadeRe
                     t = nearestT;
                     if(NULL != info) {
                         info->hitObject = (void*)hitTriangle;
+                        info->u = (Float)u;
+                        info->v = (Float)v;
                     }
                 }
                 return true;
@@ -200,7 +204,8 @@ int KDNode::hitCount(const Ray& ray, float& t, float& tmin) {
         else {
             float to;
             for (size_t i=0; i < this->triangles.size(); i++) {
-                if (this->triangles[i]->hit(ray, to, tmin) && to>tmin) {
+                float u,v;
+                if (this->triangles[i]->hit(ray, to, tmin, u, v) && to>tmin) {
                     count++;
                 }
             }

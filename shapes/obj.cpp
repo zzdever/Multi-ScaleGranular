@@ -827,7 +827,7 @@ public:
 		for (size_t i=0; i<m_meshes.size(); ++i)
 			result += m_meshes[i]->getEffectivePrimitiveCount();
 		return result;
-	}
+    }
 
 	MTS_DECLARE_CLASS()
 private:

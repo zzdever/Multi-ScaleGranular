@@ -7,11 +7,11 @@ BBox::BBox(const FastBVH::Vector3& min, const FastBVH::Vector3& max)
 BBox::BBox(const FastBVH::Vector3& p)
   : min(p), max(p) { extent = max - min; }
 
-  void BBox::expandToInclude(const FastBVH::Vector3& p) {
-    min = FastBVH::min(min, p);
-    max = FastBVH::max(max, p);
-    extent = max - min;
-  }
+void BBox::expandToInclude(const FastBVH::Vector3& p) {
+	min = FastBVH::min(min, p);
+	max = FastBVH::max(max, p);
+	extent = max - min;
+}
 
 void BBox::expandToInclude(const BBox& b) {
   min = FastBVH::min(min, b.min);
