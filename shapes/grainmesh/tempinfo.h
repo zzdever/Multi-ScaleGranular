@@ -32,7 +32,11 @@ struct GrainIntersectionInfo{
     Vector dpdu, dpdv;
 };
 
-
+struct ScatterometerReturnInfo{
+    bool isIntersected;
+    Point intersection;
+    Vector outDirection;
+};
 
 
 

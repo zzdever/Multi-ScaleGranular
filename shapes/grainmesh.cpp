@@ -225,18 +225,11 @@ public:
         SAMPLE_NUM = 10;
     }
 
-    void precomputeTSDF() {
-        long hitCount = 0;
-
-        Point origin;
-        Vector dir;
-
-        Float coord_theta, coord_phi, theta, phi;
-        Vector coord_x, coord_y, coord_z;
-        //hitInfo hitinfo;
-        //Intersection its;
-
-
+    void precomputeTSDF(double &lamda_sigma,
+                        double &lamda_s,
+                        Spectrum &alpha_s,
+                        double &beta,
+                        double &hg_g) {
         // setup the scene
         PluginManager *pluginManager = PluginManager::getInstance();
 
@@ -246,9 +239,19 @@ public:
 
         /* shape */
         ref<Shape> shape = static_cast<Shape*> (this);
-        shape->incRef();
+        shape->addChild(this->getBSDF()); /* BSDF */
         shape->configure();
+        shape->incRef();
         scatterometer->addShape(shape.get());
+
+        /* emitter */
+        Properties emitterProp("constant");
+        emitterProp.setSpectrum("radiance", Spectrum(1.0f));
+        ref<Emitter> emitter = static_cast<Emitter*> (
+                    pluginManager->createObject(MTS_CLASS(Emitter), Properties(emitterProp)));
+        emitter->configure();
+        emitter->incRef();
+        scatterometer->addChild(emitter.get());
 
         /* integrator */
         Properties integratorProp("multiscale");
@@ -270,10 +273,63 @@ public:
         scatterometer->configure();
 
 
+#if 0
+        {
+            uint8_t temp[MTS_KD_INTERSECTION_TEMP];
+            std::cout<<"ppppppppppppp"<<std::endl;
+            Point oo = Point(5,0,0);
+            int size = 800;
+            for(int i=0; i<size; i++) {
+                for(int j=0; j<size; j++) {
+                    RayDifferential ray(oo, Point(2.0, (i-size/2.0)/(size/2.0), (j-size/2.0)/(size/2.0))-oo, (Float)0);
+                    ray.mint = 0.;
+                    RadianceQueryRecord rRec(scatterometer.get(), sampler.get());
+                    rRec.type = RadianceQueryRecord::ERadianceNoEmission;
+                    rRec.its.temp = (void*)temp;
+                    /* Perform a scene intersection */
+                    Spectrum spectrum = integrator->Li(ray, rRec);
+                    std::cout<<i<<" "<<j<<" "<<spectrum[0]<<" "<<spectrum[1]<<" "<<spectrum[2]<<" "<<std::endl;
+                }
+            }
+            exit(0);
+        }
+#endif
+
+
+        // simulation
+
         fs::ofstream is(fs::path("/Users/ying/grainstatics.py"));
         if(OUTPUT_DATA) {
             is<<"data = [";
         }
+
+        // statics
+        long hitCount = 0; // hit the grain
+        //Float hitTotalTeleport = 0.;
+        long notHitCount = 0; // hit sphere but not hit grain
+        Float notHitTotalTeleport = 0.;
+        long scatteredEscapeCount = 0; // hit the grain and escape the sphere after scattering
+        Float scatteredEscapeTeleport = 0.;
+        Float cosThetaSum = 0.;
+
+        Spectrum albedos(0.0f);
+        Spectrum raySpectrum(0.0f);
+
+        long rayID = 0;
+        long canNotSolve = 0;
+
+
+        Point origin;
+        Vector dir;
+
+        Float coord_theta, coord_phi, theta, phi;
+        Vector coord_x, coord_y, coord_z;
+        //hitInfo hitinfo;
+        //Intersection its;
+
+
+        uint8_t temp[MTS_KD_INTERSECTION_TEMP];
+        ScatterometerReturnInfo* returnInfo = (ScatterometerReturnInfo*)((void*)temp);
 
         // uniformly sample origin, on sphere
         for(int i=0; i<SAMPLE_NUM; i++) {
@@ -297,6 +353,7 @@ public:
                 theta = (1.0*random()/RAND_MAX - 0.5) * M_PI; // -pi/2 ~ pi/2
                 phi = (1.0*random()/RAND_MAX - 0.5) * M_PI; // -pi/2 ~ pi/2
                 dir = normalize(Vector(cos(phi)*cos(theta), sin(phi), -cos(phi)*sin(theta)));
+                assert(dir.x>=0);
                 Vector4 tmpd = m*Vector4(dir.x, dir.y, dir.z, 1);
                 dir = normalize(Vector(tmpd.x, tmpd.y, tmpd.z));
 
@@ -318,17 +375,36 @@ public:
                 */
 
                 RayDifferential ray(origin + dir * (-1.)/* pull the tay back out of the AABB */, dir, (Float)0);
+                ray.mint = 0.;
+                rayID++;
                 RadianceQueryRecord rRec(scatterometer.get(), sampler.get());
-                rRec.type = RadianceQueryRecord::ESensorRay;
+                rRec.type = RadianceQueryRecord::ERadianceNoEmission;
+                rRec.its.temp = (void*)temp;
+
+
+                /* test for first time */
+                RayDifferential ray_copy(ray);
+                RadianceQueryRecord rRec_copy(rRec);
+                if(! rRec_copy.rayIntersect(ray_copy)) {
+                    notHitCount++;
+
+                    Float s = dot(ray.d, Point(0,0,0)-ray.o);
+                    Float l_2 = dot(Point(0,0,0)-ray.o, Point(0,0,0)-ray.o);
+                    Float h_2 = l_2 - s*s;
+                    notHitTotalTeleport += 2 * math::safe_sqrt(1.0 - h_2);
+
+                    continue;
+                }
+
+                hitCount++;
 
                 /* Perform a scene intersection */
-                integrator->Li(ray, rRec);
+                raySpectrum = integrator->Li(ray, rRec);
 
-                if(! rRec.its.isValid())
-                    continue;
-
-                // hit
-                hitCount++;
+                if(! rRec.its.isValid()) {
+                    scatteredEscapeCount++;
+                    albedos += raySpectrum;
+                }
 
                 /*
                 Normal n = static_cast<grain::KDTriangle*>(hitinfo.hitObject)->getNormal();
@@ -336,22 +412,38 @@ public:
                 Vector outd = normalize(-2 * dot(ray.d, normalize(n)) * normalize(n) + ray.d);
                 */
 
-                Vector outd = normalize(rRec.its.wi);
+                Point hit = returnInfo->intersection;
+                Vector outd = returnInfo->outDirection;
+
 
                 // cos(theta)
                 Float cosTheta = dot(dir, outd);
+                cosThetaSum += cosTheta;
 
-                /*
+                // scattered teleport
                 double A = outd.x*outd.x + outd.y*outd.y + outd.z*outd.z;
                 double B = 2*(hit.x*outd.x + hit.y*outd.y + hit.z*outd.z);
                 double C = hit.x*hit.x + hit.y*hit.y + hit.z*hit.z - 1.0;
                 double nearT, farT;
 
-                if (! solveQuadraticDouble(A, B, C, nearT, farT))
+                if (! solveQuadraticDouble(A, B, C, nearT, farT)) {
+                    canNotSolve++;
                     continue;
+                }
 
                 Point out = hit + ((Float)farT) * outd;
-                Point projection = ray.o + dot(ray.d, out-ray.o) * ray.d;
+                scatteredEscapeTeleport += dot(out-origin, dir);
+
+#if 0
+                std::cout<<rayID<<">>>>>>>>>"<<std::endl<<"origin: "<<origin.toString()<<std::endl
+                        <<"hit: "<<hit.toString()<<std::endl
+                       <<"outd: "<<outd.toString()<<std::endl
+                             <<rayID<<"<<<<<<<< with T: "<<farT<<std::endl;
+#endif
+
+
+                /*
+                Point projection = ray.o + dot(ray.d, out-ray.o) * ray.d; // deprecated, wrong ray.o
 
                 // r, z
                 Float r = distance(out, projection);
@@ -371,15 +463,28 @@ public:
         }
 
         shape->decRef();
+        emitter->decRef();
         integrator->decRef();
         sampler->decRef();
         scatterometer->decRef();
 
+        lamda_sigma = (notHitCount==0 ? 0 : (notHitTotalTeleport / notHitCount));
+        lamda_s = (scatteredEscapeCount==0 ? 0 : (scatteredEscapeTeleport / scatteredEscapeCount)); // TODO ??????
+        //alpha_s = (hitCount==0 ? 0 : (1.0*scatteredEscapeCount/hitCount));
+        alpha_s = albedos / scatteredEscapeCount;
+        beta = hitCount * 1.0 / (SAMPLE_NUM*SAMPLE_NUM);
+        hg_g = cosThetaSum / hitCount;
+
 
         if(OUTPUT_DATA) {
             is<<"]"<<std::endl;
-            std::cout<<"hit probability: "<<hitCount * 1.0 / (SAMPLE_NUM*SAMPLE_NUM)<<std::endl;
             is.close();
+
+
+            std::cout<<"hitCount: "<<hitCount<<", notHitCount: "<<notHitCount<<", notHitTotalTeleport: "<<notHitTotalTeleport
+                       <<", scatteredEscapeCount: "<<scatteredEscapeCount<<", scatteredEscapeTeleport: "<<scatteredEscapeTeleport<<std::endl
+                         <<", canNotSolve: "<<canNotSolve<<std::endl<<"albedos: "<<(albedos).toString()<<std::endl;
+
         }
     }
 
@@ -528,6 +633,7 @@ private:
     ref<ShapeKDTree> m_shapeKDTree;
     SpherePackDict *m_spherePackDict;
     std::vector<Grain*> m_grains;
+    int m_loadingGrain;
 
     // others
     MODES_T m_renderMode;
@@ -657,27 +763,40 @@ public:
 
 
     /* fill in parameters, etc. for VPT render mode */
-    void VPTSetup() {
+    void VPTSetup(// length param
+                  double &lamda_sigma,
+                  double &lamda_s,
+                  // ratio param
+                  Spectrum &alpha_s,
+                  double &beta,
+                  double &hg_g) {
         double f = m_spherePackDict->getPackingRate();
         double r = m_spherePackDict->getSphereR();
-        double hg_g = 0.7;
-        double lamda_sigma = 0.85;
-        double alpha_s = 0.68;
-        double lamda_s = 0.50;
-        double beta = 0.63;
+
+        lamda_sigma = r * lamda_sigma;
+        lamda_s = r * lamda_s;
 
         double lamda_b = 1.0 / (3*f / (4*r*(1-f)));
         double lamda_beta = (lamda_b + lamda_sigma) * (1 - beta) / beta + lamda_b;
-        double sigma_t = 1.0 / (lamda_beta + alpha_s * lamda_s);
+        //double sigma_t = 1.0 / (lamda_beta + alpha_s * lamda_s);
+        Spectrum sigma_t(0.0f);
+        for (int i=0; i<SPECTRUM_SAMPLES; i++) {
+            sigma_t[i] = 1.0 / (lamda_beta + alpha_s[i] * lamda_s);
+        }
 
         //double v = 1.0*random()/RAND_MAX;
         //t = log(1-v) / (-sigma_t) * gridSpan.x / 2;
 
-        Log(EInfo, "VPT parameters. sigmaT: %f, albedo: %f", sigma_t, alpha_s);
+        Log(EInfo, "VPT parameters:\nAverage not-hit teleport(lamda_sigma): %f"
+            "\nAverage scattered teleport(lamda_s): %f"
+            "\nAlbedo(alpha_s): %s"
+            "\nHit probability(beta): %f"
+            "\nhg g: %f"
+            , lamda_sigma, lamda_s, alpha_s.toString().c_str(), beta, hg_g);
 
         Properties props;
-        props.setSpectrum(std::string("sigmaT"), Spectrum((Float)sigma_t));
-        props.setSpectrum(std::string("albedo"), Spectrum((Float)alpha_s));
+        props.setSpectrum(std::string("sigmaT"), sigma_t);
+        props.setSpectrum(std::string("albedo"), alpha_s);
         props.setFloat("g", (Float)hg_g);
         HomogeneousMedium* interior_medium = new HomogeneousMedium(props);
         interior_medium->addChild((ConfigurableObject*)(new HGPhaseFunction(props)));
@@ -691,6 +810,8 @@ public:
 
         control_timer = new Timer();
 
+
+        m_loadingGrain = -2;
 
         ref<FileResolver> fileResolver = Thread::getThread()->getFileResolver()->clone();
 
@@ -740,8 +861,10 @@ public:
 
         ref<Timer> timer = new Timer();
 
+        m_loadingGrain = -1;
         loadWavefrontOBJ(m_meshes, m_materialAssignment,
                          m_name, is, fileResolver, m_objectToWorld, m_collapse, flipTexCoords, loadMaterials, shapeIndex);
+        m_loadingGrain = -2;
 
         /* smooth angle */
         if (props.hasProperty("maxSmoothAngle")) {
@@ -813,7 +936,9 @@ public:
 
             std::vector<TriMesh*> meshes;
             std::vector<std::string> materials;
+            m_loadingGrain = i;
             loadWavefrontOBJ(meshes, materials, ss.str(), is, fileResolver, m_objectToWorld);
+            m_loadingGrain = -2;
 
             // create kd-tree for this grain
             /*
@@ -871,24 +996,11 @@ public:
             m_dimensionX = 2;
             m_dimensionY = 2;
             m_dimensionZ = 2;
-
-
-            /*
-            int dim = 8;
-            for(int i=0; i<dim*dim*dim; i++) {
-                m_voxels[i] = 1;
-                m_dimensionX = dim;
-                m_dimensionY = dim;
-                m_dimensionZ = dim;
-            }
-            */
         }
 
     }
 
     void configure() {
-        Shape::configure();
-
         m_aabb.reset();
         for (size_t i=0; i<m_meshes.size(); ++i) {
             m_meshes[i]->configure();
@@ -907,83 +1019,50 @@ public:
         Log(EInfo, "volume aabb:\n%s", m_volume_aabb.toString().c_str());
 
 
-        /* setup VPT parameters */
-        VPTSetup();
+        if(VPT==m_renderMode) {
+            double lamda_sigma, lamda_s, beta, hg_g;
+            Spectrum alpha_s(0.0f);
 
+            /* precompute TSDF */
+            Log(EInfo, "Precomputing TSDFs...");
 
-#if 0
-        /* precompute TSDF */
-        Log(EInfo, "Precomputing TSDFs...");
-
-        ref<Timer> timer = new Timer();
-        timer->reset();
-        for(size_t i=0; i<m_grains.size(); i++) {
-          ((Grain*)m_grains.at(i))->precomputeTSDF();
-        }
-
-        Log(EInfo, "Precomputed TSDFs for %d grain mesh(es) (took %i ms)",m_grainMeshCount, timer->getMilliseconds());
-#endif
-
-
-#if 0
-
-        std::cout<<"ppppppppppppp"<<std::endl;
-
-        // setup the scene
-        PluginManager *pluginManager = PluginManager::getInstance();
-
-        /* scatterometer scene */
-        ref<Scatterometer> scatterometer = new Scatterometer();
-
-        /* shape */
-        Properties sphereProp("sphere");
-        sphereProp.setPoint("center", Point(0,0,0));
-        sphereProp.setFloat("radius", 1.f);
-        ref<Shape> shape = static_cast<Shape*> (
-                    pluginManager->createObject(MTS_CLASS(Shape), sphereProp));
-        shape->setBSDF(this->getBSDF());
-        shape->configure();
-        scatterometer->addShape(shape.get());
-
-        /* integrator */
-        Properties integratorProp("multiscale");
-        integratorProp.setInteger("maxDepth", 8);
-        ref<SamplingIntegrator> integrator = static_cast<SamplingIntegrator*> (
-                    pluginManager->createObject(MTS_CLASS(Integrator), Properties(integratorProp)));
-        integrator->configure();
-        scatterometer->setIntegrator(integrator.get());
-
-        /* sampler */
-        ref<Sampler> sampler = static_cast<Sampler*> (
-                    pluginManager->createObject(MTS_CLASS(Sampler), Properties("independent")));
-        sampler->configure();
-        scatterometer->setSampler(sampler.get());
-
-        scatterometer->initialize();
-        scatterometer->configure();
-
-
-        Point oo = Point(0,0,5);
-        int size = 800;
-        for(int i=0; i<size; i++) {
-            for(int j=0; j<size; j++) {
-
-                RayDifferential ray(oo, Point((i-size/2.0)/(size/2.0), (j-size/2.0)/(size/2.0), 2.0)-oo, (Float)0);
-                RadianceQueryRecord rRec(scatterometer.get(), sampler.get());
-                rRec.type = RadianceQueryRecord::ERadiance;
-                rRec.depth = 1;
-
-                /* Perform a scene intersection */
-                Spectrum spectrum = integrator->Li(ray, rRec);
-
-
-                std::cout<<i<<" "<<j<<" "<<spectrum[0]<<" "<<spectrum[1]<<" "<<spectrum[2]<<" "<<std::endl;
+            ref<Timer> timer = new Timer();
+            timer->reset();
+            for(size_t i=0; i<m_grains.size(); i++) {
+              ((Grain*)m_grains.at(i))->precomputeTSDF(lamda_sigma, lamda_s, alpha_s, beta, hg_g);
             }
+
+            Log(EInfo, "Precomputed TSDFs for %d grain mesh(es) (took %i ms)",m_grainMeshCount, timer->getMilliseconds());
+
+            /* setup VPT parameters */
+            lamda_sigma = lamda_sigma * gridSpan.x;
+            lamda_s = lamda_s * gridSpan.x;
+            VPTSetup(lamda_sigma, lamda_s, alpha_s, beta, hg_g);
         }
 
+        Shape::configure();
 
+
+
+
+
+#if 0
+        AABB abab(Point(0,0,0), Point(10,10,10));
+        Float nt=-1.0/0.0, ft=1.0/0.0;
+        Point np, fp;
+
+        Ray ray(Point(5,5,5), Vector(1,0,0), Float(0));
+        bool res = abab.rayIntersect(ray, nt, ft, np, fp);
+        std::cout<<res<<" "<<nt<<" "<<ft<<std::endl<<np.toString()<<std::endl<<fp.toString()<<std::endl;
+
+
+        nt=-1.0/0.0, ft=1.0/0.0;
+        Ray ray2(Point(5,5,-10), Vector(0,0,1), Float(0));
+        res = abab.rayIntersect(ray2, nt, ft, np, fp);
+        std::cout<<res<<" "<<nt<<" "<<ft<<std::endl<<np.toString()<<std::endl<<fp.toString()<<std::endl;
+
+        exit(0);
 #endif
-
 
         // TODO determine EPT, VPT, DA
 #if 0
@@ -1161,22 +1240,66 @@ public:
 
                 while(test_sphere) {
                     // test sphere
+
+
+                    int tx=x, ty=y, tz=z;
+
+
                     if(! m_spherePackDict->rayIntersect(
                             voxelIndex,
                             // transform into the unit voxel coordinate
-                            Ray(Point((ray.o.x - aabb.min.x) / gridSpan.x - x,
-                                      (ray.o.y - aabb.min.y) / gridSpan.y - y,
-                                      (ray.o.z - aabb.min.z) / gridSpan.z - z),
+                            Ray(Point((ray.o.x - aabb.min.x) / gridSpan.x - tx,
+                                      (ray.o.y - aabb.min.y) / gridSpan.y - ty,
+                                      (ray.o.z - aabb.min.z) / gridSpan.z - tz),
                                 ray.d, ray.time),
-                            sphereIntersectionInfo))
+                            sphereIntersectionInfo)) {
                         break;
+                    }
+
+
+
+                    /*
+                    int lx, ly, lz;
+                    lx = x - stepX*inc.x;
+                    ly = y - stepY*inc.y;
+                    lz = z - stepZ*inc.z;
+                    bool sphereIntersected = false;
+                    for(int dx=-1; dx<=1; dx++)
+                        for(int dy=-1; dy<=1; dy++)
+                            for(int dz=-1; dz<=1; dz++) {
+                                tx = x + dx;
+                                ty = y + dy;
+                                tz = z + dz;
+                                if(tx<0 || tx>=m_dimensionX || ty<0 || ty>=m_dimensionY || tz<0 || tz>=m_dimensionZ)
+                                    continue;
+                                if(tx==lx && ty==ly && tz==lz) continue;
+
+                                voxelIndex = tx * m_dimensionY * m_dimensionZ + tz * m_dimensionY + ty;
+                                if(m_spherePackDict->rayIntersect(
+                                        voxelIndex,
+                                        // transform into the unit voxel coordinate
+                                        Ray(Point((ray.o.x - aabb.min.x) / gridSpan.x - tx,
+                                                  (ray.o.y - aabb.min.y) / gridSpan.y - ty,
+                                                  (ray.o.z - aabb.min.z) / gridSpan.z - tz),
+                                            ray.d, ray.time),
+                                        sphereIntersectionInfo)) {
+                                    sphereIntersected = true;
+                                    break;
+                                }
+                            }
+                    if(!sphereIntersected)
+                        break;
+
+
+                    std::cout<<"we are out"<<std::endl;
+                    */
 
 
                     const FastBVH::Sphere* sphere = static_cast<const FastBVH::Sphere*>(sphereIntersectionInfo.I.object);
                     Point center;
-                    center.x = (sphere->center.x + x) * gridSpan.x + aabb.min.x;
-                    center.y = (sphere->center.y + y) * gridSpan.y + aabb.min.y;
-                    center.z = (sphere->center.z + z) * gridSpan.z + aabb.min.z;
+                    center.x = (sphere->center.x + tx) * gridSpan.x + aabb.min.x;
+                    center.y = (sphere->center.y + ty) * gridSpan.y + aabb.min.y;
+                    center.z = (sphere->center.z + tz) * gridSpan.z + aabb.min.z;
 
                     bool test_grain = true;
                     // half-empty
@@ -1248,9 +1371,9 @@ public:
 
                     // skip this sphere. sphere not in aggregate mesh or grain not hit.
                     Point hitPoint;
-                    hitPoint.x = (sphereIntersectionInfo.I.hit.x + x) * gridSpan.x + aabb.min.x;
-                    hitPoint.y = (sphereIntersectionInfo.I.hit.y + y) * gridSpan.y + aabb.min.y;
-                    hitPoint.z = (sphereIntersectionInfo.I.hit.z + z) * gridSpan.z + aabb.min.z;
+                    hitPoint.x = (sphereIntersectionInfo.I.hit.x + tx) * gridSpan.x + aabb.min.x;
+                    hitPoint.y = (sphereIntersectionInfo.I.hit.y + ty) * gridSpan.y + aabb.min.y;
+                    hitPoint.z = (sphereIntersectionInfo.I.hit.z + tz) * gridSpan.z + aabb.min.z;
 
                     ray.o = hitPoint +
                             (2 * (dot(ray.d,
@@ -1310,6 +1433,33 @@ public:
             bool res = m_mesh_kdtree->hit(ray, tout, tmin, &hitinfo);
             */
 
+#if 0
+            if(simpledebug) {
+                Float nt=-1.0/0.0, ft=1.0/0.0;
+                bool res = m_volume_aabb.rayIntersect(ray, nt, ft);
+
+                std::cout<<"gggg 000000"<<std::endl;
+
+                if(temp){
+                    // init the temp space, MTS_KD_INTERSECTION_TEMP-4 bytes
+                    new(temp) GrainIntersectionInfo;
+                    GrainIntersectionInfo* grainIntersectionInfo = static_cast<GrainIntersectionInfo*>(temp);
+                    grainIntersectionInfo->rendermode = VPT;
+                }
+
+                std::cout<<"gggg 1111111"<<std::endl;
+
+                if(res) {
+                    if(nt>=mint && nt<=maxt) t = nt;
+                    else if(ft>=mint && ft<=maxt) t = ft;
+                    else return false;
+                }
+
+                std::cout<<"gggg 222222"<<std::endl;
+                return res;
+            }
+
+#endif
             Intersection its;
             bool res = m_shapeKDTree->rayIntersect(ray, its);
 
@@ -1980,34 +2130,50 @@ public:
     void addChild(const std::string &name, ConfigurableObject *child, bool warn) {
         const Class *cClass = child->getClass();
         if (cClass->derivesFrom(MTS_CLASS(BSDF))) {
-            Shape::addChild(name, child);
-            Assert(m_meshes.size() > 0);
-
-            if (name == "") {
-                for (size_t i=0; i<m_meshes.size(); ++i)
-                    m_meshes[i]->addChild(name, child);
-            } else {
-                bool found = false;
-                for (size_t i=0; i<m_meshes.size(); ++i) {
-                    if (m_materialAssignment[i] == name) {
-                        found = true;
+            /* add bsdf to an individual grain */
+            bool added = false;
+            // named bsdf in scene file
+            for (size_t i=0; i<m_grains.size(); i++) {
+                if (m_grains.at(i)->getName() == name) {
+                    added = true;
+                    m_grains.at(i)->addChild(child);
+#if 0
+                    // TODO mix BSDF together
+                    for (size_t i=0; i<m_meshes.size(); ++i) {
                         m_meshes[i]->addChild(name, child);
                     }
+#endif
                 }
-
-                /* add bsdf to an individual grain */
-                for (size_t i=0; i<m_grains.size(); i++) {
-                    if (m_grains.at(i)->getName() == name) {
-                        found = true;
-                        m_grains.at(i)->addChild(child);
-                    }
-                }
-
-                if (!found && warn)
-                    Log(EWarn, "Attempted to register the material named "
-                        "'%s', which does not occur in the OBJ file!", name.c_str());
             }
-            m_bsdf->setParent(NULL);
+            // named material in obj file
+            if(m_loadingGrain >= 0) {
+                added = true;
+                m_grains.at(m_loadingGrain)->addChild(child);
+            }
+
+            /* add to the aggregate shape */
+            if(! added) {
+                Shape::addChild(name, child);
+                Assert(m_meshes.size() > 0);
+
+                if (name == "") {
+                    for (size_t i=0; i<m_meshes.size(); ++i)
+                        m_meshes[i]->addChild(name, child);
+                } else {
+                    bool found = false;
+                    for (size_t i=0; i<m_meshes.size(); ++i) {
+                        if (m_materialAssignment[i] == name) {
+                            found = true;
+                            m_meshes[i]->addChild(name, child);
+                        }
+                    }
+
+                    if (!found && warn)
+                        Log(EWarn, "Attempted to register the material named "
+                            "'%s', which does not occur in the OBJ file!", name.c_str());
+                }
+                m_bsdf->setParent(NULL);
+            }
         } else if (cClass->derivesFrom(MTS_CLASS(Emitter))) {
             if (m_meshes.size() > 1)
                 Log(EError, "Cannot attach an emitter to an OBJ file "

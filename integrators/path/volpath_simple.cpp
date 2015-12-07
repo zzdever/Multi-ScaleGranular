@@ -117,7 +117,7 @@ public:
 				/* Sample the integral
 				   \int_x^y tau(x, x') [ \sigma_s \int_{S^2} \rho(\omega,\omega') L(x,\omega') d\omega' ] dx'
 				*/
-				const PhaseFunction *phase = rRec.medium->getPhaseFunction();
+                const PhaseFunction *phase = rRec.medium->getPhaseFunction();
 
 				throughput *= mRec.sigmaS * mRec.transmittance / mRec.pdfSuccess;
 
